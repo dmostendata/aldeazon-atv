@@ -1,0 +1,46 @@
+# docker-compose.yml
+name: aldeazon-atv-local
+
+services:
+  # Equivalent to VPS3: The immutable traceability layer
+  postgres:
+    image: postgres:16-alpine
+    container_name: aldeazon-atv-local-postgres-1
+    # FIX: Left side is macOS host (5434), right side is Postgres internal (5432)
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: aldeazon_user
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: atv_qa
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aldeazon_user -d atv_qa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Equivalent to VPS4: The high-speed Vector DB (Read Model)
+  qdrant:
+    image: qdrant/qdrant:v1.9.1
+    ports:
+      - "127.0.0.1:6333:6333" # REST API
+      - "127.0.0.1:6334:6334" # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # Equivalent to VPS4: Semantic Cache and Celery Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: aldeazon-atv-local-redis-1
+    # CORRECT: Left side is macOS host (6380), right side is Redis internal (6379)
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:

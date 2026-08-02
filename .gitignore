@@ -1,9 +1,20 @@
-node_modules/
-vendor/
-*.log
-.DS_Store
-Thumbs.db
+# Python Virtual Environment
+.venv/
+
+# Environments & Secrets
 .env
 .env.backup
 .env.production
 absolutkarlos.env
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Local Database Data
+postgres_data/
+
+# OS files
+.DS_Store
+Thumbs.db
+fixtures/
