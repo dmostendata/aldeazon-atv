@@ -1,4 +1,4 @@
-# app/models/telemetry.py
+# app/models/traceability.py
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Any, Dict, List
@@ -7,19 +7,27 @@ from sqlalchemy import (
     ForeignKey, Computed, Index
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     """
-    Base class for all SQLAlchemy 2.0 models.
+    Root declarative base for all ATV SQLAlchemy 2.0 models.
+    
+    PHP/Laravel Parallel: Identical to extending 'Illuminate\Database\Eloquent\Model'.
     """
     pass
 
-class ConsultaModel(Base):
+
+class Consulta(Base):
+    """
+    Runtime traceability log for online WhatsApp interactions.
+    Enforces Ley 787 PII stripping and monitors the <=10s SLA.
+    """
     __tablename__ = "consulta"
     __table_args__ = (
         Index("idx_consulta_ts", "ts"),
-        {"schema": "atv"}  # Strict schema isolation for Ley 787 compliance
+        Index("idx_consulta_intencion_hitl", "intencion", "escalada_hitl"),
+        {"schema": "atv"}
     )
 
     consulta_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -32,12 +40,12 @@ class ConsultaModel(Base):
     respuesta: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     modelo: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     
-    # Telemetry & Cost
+    # Token Economics
     tokens_entrada: Mapped[int] = mapped_column(Integer, default=0)
     tokens_salida: Mapped[int] = mapped_column(Integer, default=0)
     costo_estimado_usd: Mapped[float] = mapped_column(Numeric(8, 6), default=0.0)
     
-    # SLA APM Metrics (Milliseconds)
+    # Micro-Latencies (SLA APM)
     lat_webhook_ms: Mapped[int] = mapped_column(Integer, default=0)
     lat_sanitizacion_ms: Mapped[int] = mapped_column(Integer, default=0)
     lat_clasif_ms: Mapped[int] = mapped_column(Integer, default=0)
@@ -45,7 +53,7 @@ class ConsultaModel(Base):
     lat_llm_ms: Mapped[int] = mapped_column(Integer, default=0)
     lat_total_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     
-    # Database-generated computed column (Read-Only in Python)
+    # Database-computed SLA flag (read-only in ORM)[cite: 17]
     sla_cumplido: Mapped[bool] = mapped_column(
         Boolean, 
         Computed("lat_total_ms <= 10000", persisted=True)
@@ -56,9 +64,45 @@ class ConsultaModel(Base):
     version_corpus: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
-class ErrorLogModel(Base):
+class InventarioArchivo(Base):
+    """
+    SharePoint file inventory for offline Airflow DAG synchronization.
+    Tracks ETags to prevent redundant downloads of unmodified PDFs (§6.5.1)[cite: 17].
+    
+    PHP/Laravel Parallel: Acts like a stateful migrations table or cache table
+    to make offline batch jobs idempotent.
+    """
+    __tablename__ = "inventario_archivo"
+    __table_args__ = (
+        Index("idx_inventario_nombre", "nombre_archivo", unique=True),
+        Index("idx_inventario_estado", "estado"),
+        {"schema": "atv"}
+    )
+
+    archivo_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    nombre_archivo: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    etag_sharepoint: Mapped[str] = mapped_column(String(128), nullable=False)
+    version_corpus: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    # 'NUEVO', 'MODIFICADO', 'RETIRADO', 'INDEXADO', 'ERROR'
+    estado: Mapped[str] = mapped_column(String(32), nullable=False)
+    
+    # 'tabla', 'columnas', 'prosa', 'vision'[cite: 17]
+    metodo_extraccion: Mapped[str] = mapped_column(String(32), default="columnas")
+    total_registros_atomicos: Mapped[int] = mapped_column(Integer, default=0)
+    ts_cargado: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
+    ts_indexado: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
+class ErrorLog(Base):
+    """
+    System-wide exception log for Superset observability and DevOps alerting[cite: 17].
+    """
     __tablename__ = "error_log"
-    __table_args__ = {"schema": "atv"}
+    __table_args__ = (
+        Index("idx_error_componente_ts", "componente", "ts"),
+        {"schema": "atv"}
+    )
 
     error_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ts: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
