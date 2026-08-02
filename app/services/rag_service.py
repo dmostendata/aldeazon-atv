@@ -9,7 +9,6 @@ from qdrant_client import QdrantClient
 from openai import AsyncOpenAI
 
 # Pythonic Pattern: Directly import immutable Pydantic Settings singleton.
-# PHP/Laravel Parallel: Identical to accessing typed configuration via config('app....').
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -27,8 +26,7 @@ REGEX_DOSIS_VALIDACION = re.compile(
     re.IGNORECASE
 )
 
-# ODAI Blueprint §6.6.7: Domain Gate regex to intercept LLM abstention and trigger HITL[cite: 14]
-# PHP/Laravel Parallel: Acts as a custom domain validator overriding pipeline state.
+# ODAI Blueprint §6.6.7: Domain Gate regex to intercept LLM abstention and trigger HITL
 REGEX_ABSTENCION = re.compile(
     r'(No\s+tengo\s+(esa\s+)?informaci[oó]n|fichas\s+vigentes|Asistencia\s+T[eé]cnica)',
     re.IGNORECASE
@@ -51,10 +49,7 @@ Eres el Asistente Técnico Virtual de AldeaZON. Ayudas a vendedores de tiendas d
 
 class RAGResult(BaseModel):
     """
-    Pydantic DTO carrying runtime execution results, APM economics, and error telemetry[cite: 14].
-    
-    PHP/Laravel Parallel: Identical to a typed Data Transfer Object (DTO)
-    or an Eloquent API Resource returned from a Service Class to an HTTP Controller.
+    Pydantic DTO carrying runtime execution results, APM economics, and error telemetry
     """
     respuesta: str
     fuente: Optional[str] = None
@@ -69,7 +64,7 @@ class RAGResult(BaseModel):
     lat_retrieval_ms: int = 0
     lat_llm_ms: int = 0
     
-    # Telemetry attributes for PostgreSQL atv.error_log persistence[cite: 14]
+    # Telemetry attributes for PostgreSQL atv.error_log persistence
     error_tipo: Optional[str] = None
     error_mensaje: Optional[str] = None
     error_stack: Optional[str] = None
@@ -78,10 +73,7 @@ class RAGResult(BaseModel):
 
 def sanitizar_pii(texto: str) -> Tuple[str, int]:
     """
-    Strips PII (cédulas, phone numbers) before sending text to external LLMs (§6.6.2)[cite: 14].
-    
-    PHP/Laravel Parallel: Equivalent to running preg_replace inside a Laravel
-    FormRequest prepareForValidation() method before executing domain logic.
+    Strips PII (cédulas, phone numbers) before sending text to external LLMs (§6.6.2)
     """
     t0 = time.perf_counter()
     texto_seguro = re.sub(r'\b\d{3}-?\d{6}-?\d{4}[A-Z]?\b', '[CEDULA]', texto)
@@ -92,7 +84,7 @@ def sanitizar_pii(texto: str) -> Tuple[str, int]:
 
 def clasificar_intencion(texto: str) -> str:
     """
-    Deterministic intent classification in <=0.3s without LLM overhead (§6.6.3)[cite: 14].
+    Deterministic intent classification in <=0.3s without LLM overhead (§6.6.3)
     """
     if REGEX_RIESGO.search(texto):
         return "recomendacion"
@@ -102,7 +94,7 @@ def clasificar_intencion(texto: str) -> str:
 def validar_groundedness_dosis(respuesta_llm: str, contexto_completo: str) -> bool:
     """
     Groundedness Gate (§6.6.7): Rejects LLM generation if any numerical dosage
-    in the response does not appear verbatim in the Qdrant context chunks[cite: 14].
+    in the response does not appear verbatim in the Qdrant context chunks
     """
     cifras_respuesta = [
         m.group(0).lower().strip() 
@@ -121,11 +113,7 @@ def validar_groundedness_dosis(respuesta_llm: str, contexto_completo: str) -> bo
 
 class ATVRagService:
     """
-    Asynchronous RAG Orchestration Service[cite: 14].
-    
-    PHP/Laravel Parallel: Acts as an injected Laravel Service Class
-    registered inside AppServiceProvider, handling domain orchestration independently
-    from HTTP controller routing.
+    Asynchronous RAG Orchestration Service
     """
     def __init__(self, qdrant_client: QdrantClient) -> None:
         self.qdrant = qdrant_client
@@ -139,13 +127,13 @@ class ATVRagService:
         self.llm_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
     async def procesar_consulta(self, consulta_raw: str) -> RAGResult:
-        # Phase 1: PII Sanitization (§6.6.2)[cite: 14]
+        # Phase 1: PII Sanitization (§6.6.2)
         consulta_sanitizada, lat_sanitizacion = sanitizar_pii(consulta_raw)
         
-        # Phase 2: Intent Classification (§6.6.3)[cite: 14]
+        # Phase 2: Intent Classification (§6.6.3)
         intencion = clasificar_intencion(consulta_sanitizada)
         
-        # Phase 3: Qdrant Retrieval via Alias (§6.6.4)[cite: 14]
+        # Phase 3: Qdrant Retrieval via Alias (§6.6.4)
         t_ret_start = time.perf_counter()
         try:
             search_result = self.qdrant.query(
@@ -258,8 +246,7 @@ class ATVRagService:
             )
         lat_llm = int((time.perf_counter() - t_llm_start) * 1000)
 
-        # Domain Gate: Override HITL if the LLM explicitly abstains due to missing context[cite: 14]
-        # PHP/Laravel Parallel: Overriding transaction state when domain logic returns an empty result set.
+        # Domain Gate: Override HITL if the LLM explicitly abstains due to missing context
         if REGEX_ABSTENCION.search(respuesta_texto):
             logger.info("LLM abstained from answering due to missing context. Overriding escalada_hitl = True.")
             return RAGResult(

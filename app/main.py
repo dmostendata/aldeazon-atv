@@ -54,9 +54,6 @@ async def procesar_consulta_interna(
 ):
     """
     Online RAG Endpoint for WhatsApp Business Cloud API integration.
-    
-    PHP/Laravel Parallel: Operates as an Invokable Controller method
-    ($request, DB::transaction) handling SLA auditing, error persistence, and HTTP formatting.
     """
     start_time = time.perf_counter()
     
@@ -65,7 +62,7 @@ async def procesar_consulta_interna(
     
     lat_total = int((time.perf_counter() - start_time) * 1000)
     
-    # Enforce ODAI Blueprint §6.7 SLA budget threshold (10,000 ms)[cite: 14]
+    # Enforce ODAI Blueprint §6.7 SLA budget threshold (10,000 ms)
     if lat_total > 10000:
         logger.warning(f"SLA Breach detected: Total latency {lat_total}ms exceeds 10,000ms threshold.")
         err_sla = ErrorLog(
@@ -76,8 +73,7 @@ async def procesar_consulta_interna(
         )
         db.add(err_sla)
 
-    # Persist runtime exceptions to atv.error_log[cite: 14]
-    # PHP/Laravel Parallel: Similar to triggering report($e) when a domain failure occurs.
+    # Persist runtime exceptions to atv.error_log
     if result.error_tipo:
         logger.warning(f"Runtime failure trapped in [{result.componente_fallo}]: {result.error_tipo}")
         err_runtime = ErrorLog(
@@ -91,7 +87,7 @@ async def procesar_consulta_interna(
 
     costo_usd = (result.tokens_entrada * 0.00000015) + (result.tokens_salida * 0.00000060)
 
-    # Persist runtime event log to PostgreSQL for Apache Superset auditing (§6.4.4)[cite: 14]
+    # Persist runtime event log to PostgreSQL for Apache Superset auditing (§6.4.4)
     log_registro = Consulta(
         vendedor_hash=request.vendedor_id,
         consulta_sanitizada=request.consulta,
