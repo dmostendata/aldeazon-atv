@@ -1,0 +1,9 @@
+node_modules/
+vendor/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.backup
+.env.production
+absolutkarlos.env
