@@ -27,10 +27,8 @@ CULTIVOS_REGEX = re.compile(
 def extraer_desde_pdf(filepath: str, nombre_archivo: str) -> Iterator[RegistroAtomico]:
     """
     Router de Extracción (ODAI Blueprint §6.5.2)[cite: 12].
-    
-    PHP/Laravel Parallel:
-    Funciona como un Pipeline de Laravel (Pipeline::send($file)->through([...]))
-    donde intentamos primero el driver principal ('pdfplumber') y, si el parser 
+
+    intentamos primero el driver principal ('pdfplumber') y, si el parser 
     estricto falla por sintaxis PDF/XREF, hacemos fallback automático a un motor 
     C++ tolerante a fallos ('pypdfium2').
     """

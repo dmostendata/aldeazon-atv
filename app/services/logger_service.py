@@ -46,8 +46,7 @@ class TelemetryLogger:
             registros_usados=registros_usados,
             version_corpus=version_corpus
         )
-        
-        # PHP Parallel: Equivalent to $logEntry->save() in Eloquent
+
         db.add(log_entry)
         await db.commit()
         await db.refresh(log_entry)
@@ -68,7 +67,7 @@ class TelemetryLogger:
             componente=componente,
             excepcion_tipo=type(excepcion).__name__,
             mensaje=str(excepcion),
-            # Extract formatted Python traceback (similar to PHP's $e->getTraceAsString())
+
             stack_trace="".join(traceback.format_tb(excepcion.__traceback__))
         )
         

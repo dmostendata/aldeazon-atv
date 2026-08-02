@@ -26,7 +26,6 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     FastAPI Dependency for database sessions.
     The 'yield' statement temporarily pauses execution, handing the session to the controller.
     Once the HTTP response is sent, execution resumes to execute the 'finally' block, safely closing the connection.
-    This replaces Laravel's automatic end-of-request PDO cleanup.
     """
     async with AsyncSessionLocal() as session:
         try:

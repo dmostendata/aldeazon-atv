@@ -7,7 +7,6 @@ class Settings(BaseSettings):
     """
     Application Configuration Singleton.
     
-    PHP/Laravel Parallel: Equivalent to config/app.php and config/services.php
     backed by Dotenv. Pydantic enforces strict runtime typing on boot.
     """
     database_url: str

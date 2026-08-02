@@ -13,8 +13,7 @@ class RegistroAtomico(BaseModel):
     version_corpus: int = Field(..., description="Assigned during Airflow indexing phase")
     
     producto: str = Field(..., description="Commercial name, e.g., 'Consento 45 SC'")
-    
-    # Optional[str] maps to PHP's nullable string type (?string). It defaults to None.
+
     principio_activo: Optional[str] = None
     cultivo: str = Field(..., description="Crop, e.g., 'Café' or '(varios/todos)'")
     

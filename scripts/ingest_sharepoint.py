@@ -30,7 +30,6 @@ CURRENT_CORPUS_VERSION = 1
 
 def get_resilient_http_session() -> requests.Session:
     """
-    PHP/Laravel Parallel: Identical to Laravel's Http::retry(3, 100)->get(...).
     Configures an HTTP session with exponential backoff for transient TCP/Graph errors.
     """
     session = requests.Session()

@@ -12,8 +12,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 class Base(DeclarativeBase):
     """
     Root declarative base for all ATV SQLAlchemy 2.0 models.
-    
-    PHP/Laravel Parallel: Identical to extending 'Illuminate\Database\Eloquent\Model'.
+
     """
     pass
 
@@ -68,9 +67,7 @@ class InventarioArchivo(Base):
     """
     SharePoint file inventory for offline Airflow DAG synchronization.
     Tracks ETags to prevent redundant downloads of unmodified PDFs (§6.5.1)[cite: 17].
-    
-    PHP/Laravel Parallel: Acts like a stateful migrations table or cache table
-    to make offline batch jobs idempotent.
+
     """
     __tablename__ = "inventario_archivo"
     __table_args__ = (
