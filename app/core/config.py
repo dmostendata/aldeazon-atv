@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     backed by Dotenv. Pydantic enforces strict runtime typing on boot.
     """
     database_url: str
+
+    api_key: str
     
     # Microsoft Graph API Credentials
     ms_tenant_id: str
@@ -21,6 +23,14 @@ class Settings(BaseSettings):
     # Meta / WhatsApp Credentials
     meta_verify_token: str = "aldeazon_atv_secure_token_2026"
     meta_app_secret: str = "your_meta_app_secret"
+
+    # Open AI API Key
+    openai_api_key: str
+
+    #Qdrant
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: str
+    qdrant_collection: str = "atv_corpus"
     
     # Hugging Face Authentication (Prevents Hub rate-limit warnings)
     hf_token: str | None = None

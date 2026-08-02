@@ -1,16 +1,21 @@
 # app/main.py
 import time
-import re
+import logging
 from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from qdrant_client import QdrantClient
 
+from app.core.config import settings
 from app.core.database import engine, get_db
 from app.models.traceability import Base, Consulta, ErrorLog
+from app.services.rag_service import ATVRagService
 
-# Ensure the isolated 'atv' schema and tables exist on boot[cite: 17]
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
 with engine.connect() as conn:
     conn.execute(text("CREATE SCHEMA IF NOT EXISTS atv"))
     conn.commit()
@@ -19,10 +24,11 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="ATV Internal API - AldeaZON")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+qdrant_client = QdrantClient(url=settings.qdrant_url)
 
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
-    VALID_API_KEY = "aldeazon_internal_app_secret_2026"
+    VALID_API_KEY = settings.api_key
     if api_key != VALID_API_KEY:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     return api_key
@@ -41,70 +47,80 @@ class ChatResponse(BaseModel):
     latencia_ms: int
 
 
-def sanitizar_pii(texto: str) -> str:
-    """
-    Strips PII from text before external LLM API calls (Ley 787 compliance) (§6.6.2)[cite: 17].
-    """
-    texto = re.sub(r'\b\d{3}-?\d{6}-?\d{4}[A-Z]?\b', '[CEDULA]', texto)
-    texto = re.sub(r'\b[578]\d{7}\b', '[TELEFONO]', texto)
-    return texto
-
-
 @app.post("/api/v1/consultar", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
-async def procesar_consulta_interna(request: ChatRequest, db: Session = Depends(get_db)):
-    start_time = time.time()
+async def procesar_consulta_interna(
+    request: ChatRequest, 
+    db: Session = Depends(get_db)
+):
+    """
+    Online RAG Endpoint for WhatsApp Business Cloud API integration.
     
-    # Phase 1: PII Sanitization (Ley 787)[cite: 17]
-    t0 = time.time()
-    texto_seguro = sanitizar_pii(request.consulta)
-    lat_sanitizacion = int((time.time() - t0) * 1000)
+    PHP/Laravel Parallel: Operates as an Invokable Controller method
+    ($request, DB::transaction) handling SLA auditing, error persistence, and HTTP formatting.
+    """
+    start_time = time.perf_counter()
     
-    # Phase 2: Classification & Retrieval (Mocks representing active Qdrant search)
-    t1 = time.time()
-    respuesta_rag = "Aplica 1,5 L/ha. Valida con Asistencia Técnica."
-    fuente = "ficha_consento.pdf, v1"
-    hitl = True
-    lat_retrieval = int((time.time() - t1) * 1000)
+    rag_service = ATVRagService(qdrant_client=qdrant_client)
+    result = await rag_service.procesar_consulta(request.consulta)
     
-    lat_total = int((time.time() - start_time) * 1000)
+    lat_total = int((time.perf_counter() - start_time) * 1000)
     
-    # Ensure SLA <= 10,000ms[cite: 17]
+    # Enforce ODAI Blueprint §6.7 SLA budget threshold (10,000 ms)[cite: 14]
     if lat_total > 10000:
-        err = ErrorLog(
+        logger.warning(f"SLA Breach detected: Total latency {lat_total}ms exceeds 10,000ms threshold.")
+        err_sla = ErrorLog(
             componente="atv_api",
-            excepcion_tipo="SLABreachError",
-            mensaje=f"Presupuesto de latencia excedido: {lat_total}ms",
+            excepcion_tipo="SLABreachWarning",
+            mensaje=f"Presupuesto de latencia excedido: {lat_total}ms para vendedor {request.vendedor_id}",
             resuelto=False
         )
-        db.add(err)
-    
-    # Phase 3: Audit Logging to atv.consulta[cite: 17]
+        db.add(err_sla)
+
+    # Persist runtime exceptions to atv.error_log[cite: 14]
+    # PHP/Laravel Parallel: Similar to triggering report($e) when a domain failure occurs.
+    if result.error_tipo:
+        logger.warning(f"Runtime failure trapped in [{result.componente_fallo}]: {result.error_tipo}")
+        err_runtime = ErrorLog(
+            componente=result.componente_fallo or "rag_service",
+            excepcion_tipo=result.error_tipo,
+            mensaje=result.error_mensaje or "Error no especificado en tiempo de ejecución",
+            stack_trace=result.error_stack,
+            resuelto=False
+        )
+        db.add(err_runtime)
+
+    costo_usd = (result.tokens_entrada * 0.00000015) + (result.tokens_salida * 0.00000060)
+
+    # Persist runtime event log to PostgreSQL for Apache Superset auditing (§6.4.4)[cite: 14]
     log_registro = Consulta(
         vendedor_hash=request.vendedor_id,
-        consulta_sanitizada=texto_seguro,
-        intencion="recomendacion",
-        confianza=0.850,
-        escalada_hitl=hitl,
-        respuesta=respuesta_rag,
-        modelo="gpt-4o-mini",
-        tokens_entrada=120,
-        tokens_salida=45,
-        costo_estimado_usd=0.000045,
+        consulta_sanitizada=request.consulta,
+        intencion=result.intencion,
+        confianza=result.confianza,
+        escalada_hitl=result.escalada_hitl,
+        respuesta=result.respuesta,
+        modelo=result.modelo_utilizado,
+        tokens_entrada=result.tokens_entrada,
+        tokens_salida=result.tokens_salida,
+        costo_estimado_usd=costo_usd,
         lat_webhook_ms=0,
-        lat_sanitizacion_ms=lat_sanitizacion,
-        lat_retrieval_ms=lat_retrieval,
-        lat_llm_ms=50,
+        lat_sanitizacion_ms=result.lat_sanitizacion_ms,
+        lat_retrieval_ms=result.lat_retrieval_ms,
+        lat_llm_ms=result.lat_llm_ms,
         lat_total_ms=lat_total,
+        registros_usados=result.registros_usados,
         version_corpus=1
     )
     
     db.add(log_registro)
+    
+    # Single atomic commit writes both atv.consulta and atv.error_log
     db.commit()
     db.refresh(log_registro)
     
     return ChatResponse(
-        respuesta=respuesta_rag,
-        fuente=fuente,
-        escalada_hitl=hitl,
+        respuesta=result.respuesta,
+        fuente=result.fuente,
+        escalada_hitl=result.escalada_hitl,
         latencia_ms=lat_total
     )
