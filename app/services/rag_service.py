@@ -3,6 +3,7 @@ import re
 import time
 import logging
 import traceback
+import httpx
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
@@ -123,8 +124,13 @@ class ATVRagService:
         # Globally bind the 1024-dim model to this QdrantClient instance.
         # This prevents qdrant_client from falling back to default 384-dim BAAI/bge-small-en.
         self.qdrant.set_model(self.model_name)
-        
-        self.llm_client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+        # Explicitly pass an async HTTP client to prevent keyword argument collisions
+        custom_http_client = httpx.AsyncClient()
+        self.llm_client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            http_client=custom_http_client
+        )
 
     async def procesar_consulta(self, consulta_raw: str) -> RAGResult:
         # Phase 1: PII Sanitization (§6.6.2)

@@ -20,8 +20,6 @@ with engine.connect() as conn:
     conn.execute(text("CREATE SCHEMA IF NOT EXISTS atv"))
     conn.commit()
 
-Base.metadata.create_all(bind=engine)
-
 app = FastAPI(title="ATV Internal API - AldeaZON")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 qdrant_client = QdrantClient(url=settings.qdrant_url)
