@@ -11,10 +11,6 @@ logger = logging.getLogger("atv.catalog")
 # =====================================================================
 # SQLALCHEMY 2.0 CORE TABLE METADATA (SCHEMA: stc2)
 # =====================================================================
-# LARAVEL BRIDGING:
-# Defining explicit Core tables is equivalent to configuring a raw DB::table()
-# contract without booting full Eloquent ORM models. This eliminates reflection
-# and identity-map overhead in the asyncio event loop, keeping p95 latency low.
 stc2_agroquimico = table(
     "agroquimico",
     column("id"),

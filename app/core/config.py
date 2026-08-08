@@ -7,10 +7,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """
     Application Configuration Singleton.
-    
-    LARAVEL BRIDGING:
-    Equivalent to Laravel's config/* files backed by .env.
-    Pydantic v2 enforces strict runtime type validation and coercion on server boot.
     """
     # --- PostgreSQL 18 Traceability Database (VPS3) ---
     database_url: str = "postgresql+psycopg://aldeazon_user:secret@localhost:5434/atv_qa"

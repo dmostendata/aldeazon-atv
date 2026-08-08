@@ -7,7 +7,6 @@ python-dotenv==1.0.1
 python-multipart==0.0.32
 
 # --- Relational Database & Async ORM ---
-# psycopg (v3) provides native C-optimized async PostgreSQL support (Laravel Eloquent equivalent)
 SQLAlchemy==2.0.31
 psycopg[binary,pool]==3.1.19
 greenlet==3.0.3

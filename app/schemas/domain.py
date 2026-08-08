@@ -6,11 +6,6 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 class RegistroAtomico(BaseModel):
     """
     Pydantic v2 DTO representing an atomic agronomic knowledge chunk.
-    
-    LARAVEL BRIDGING:
-    Equivalent to a Laravel API Resource mixed with strict Eloquent attribute casting.
-    By setting frozen=True, we ensure thread-safety across async tasks, preventing
-    accidental state mutations during dense/sparse embedding serialization.
     """
     model_config = ConfigDict(frozen=True, str_strip_whitespace=True)
 

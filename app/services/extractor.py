@@ -1,117 +1,151 @@
 # app/services/extractor.py
 import re
-import uuid
+import io
+import base64
 import logging
+import uuid
 from typing import Iterator
 import pdfplumber
 import pypdfium2 as pdfium
-from pdfminer.pdfparser import PDFSyntaxError
+from openai import OpenAI
 
-from app.schemas.registro_atomico import RegistroAtomico
+from app.core.config import settings
+from app.schemas.domain import RegistroAtomico
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("atv.extractor")
 
-# Expresiones regulares precompiladas a nivel de módulo (boot time)
-# DOSIS_REGEX exige unidad de área (ha|mz) para evitar falsos positivos de pH (Blueprint §6.5.3)[cite: 12]
-DOSIS_REGEX = re.compile(
-    r'\d[\d.,]*\s*(?:-\s*\d[\d.,]*\s*)?\s*(?:kg|g|l|lt|ml|cc)\s*/\s*(?:ha|mz)', 
+# =====================================================================
+# ODAI BLUEPRINT §6.5.3: CRITICAL REGEX FOR AGRONOMIC GROUNDING
+# =====================================================================
+# Demands an explicit area unit (ha/mz). Prevents capturing pH or concentrations.
+REGEX_DOSIS = re.compile(
+    r'\d[\d.,]*\s*(?:-\s*\d[\d.,]*\s*)?\s*(?:kg|g|l|lt|ml|cc|%)\s*/\s*(?:ha|mz)\b',
     re.IGNORECASE
 )
 
-CULTIVOS_REGEX = re.compile(
-    r'(tomate|papa|ma[íi]z|caf[éee]|cacao|man[íi]|soya|frijol|arroz|c[íi]trico|mel[oó]n|sand[íi]a|chile|banano)', 
+# Common Nicaraguan crops for row-matching heuristics
+REGEX_CULTIVOS = re.compile(
+    r'(tomate|papa|ma[íi]z|caf[eé]|cacao|man[íi]|soya|frijol|arroz|c[íi]trico|mel[oó]n|sand[íi]a|chile|banano)',
     re.IGNORECASE
 )
 
+# ODAI Blueprint §6.5.4: Strict transcription prompt preventing LLM hallucination
+SYSTEM_VISION = """
+Eres un transcriptor de documentos técnicos agrícolas. Recibes la imagen de una página de ficha técnica. Tu única tarea es transcribirla fielmente a Markdown. Reglas estrictas:
+1. Transcribe TODO el texto visible, incluido el que está dentro de fotografías de empaques o etiquetas.
+2. Las tablas se transcriben como tablas Markdown, preservando encabezados y la correspondencia exacta fila-columna.
+3. NO resumas, NO interpretes, NO corrijas, NO completes datos que no estén visibles. Si un valor es ilegible escribe [ILEGIBLE].
+4. No agregues texto que no esté en la imagen. Nada de introducciones ni conclusiones propias.
+""".strip()
 
-def extraer_desde_pdf(filepath: str, nombre_archivo: str) -> Iterator[RegistroAtomico]:
+
+def extraer_desde_pdf(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
     """
-    Router de Extracción (ODAI Blueprint §6.5.2)[cite: 12].
-
-    intentamos primero el driver principal ('pdfplumber') y, si el parser 
-    estricto falla por sintaxis PDF/XREF, hacemos fallback automático a un motor 
-    C++ tolerante a fallos ('pypdfium2').
+    Extraction Router (ODAI Blueprint §6.5.2).
+    Dynamically routes PDFs to Deterministic or Vision parsers.
     """
-    registros_extraidos = 0
+    text_length = 0
+    has_images = False
 
-    # 1. INTENTO DETERMINISTA PRINCIPAL (pdfplumber / pdfminer.six)[cite: 12]
-    try:
-        with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
-                texto = page.extract_text()
-                if not texto:
-                    continue
-                for linea in texto.splitlines():
-                    if (cultivo := CULTIVOS_REGEX.search(linea)) and (dosis := DOSIS_REGEX.search(linea)):
-                        registros_extraidos += 1
-                        yield _crear_registro(nombre_archivo, cultivo.group(0), dosis.group(0), linea)
-                        
-        if registros_extraidos > 0:
-            return
+    # Phase 1: Pre-check heuristics
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                text_length += len(text)
+            if page.images:
+                has_images = True
 
-    except (PDFSyntaxError, Exception) as exc:
-        # Interceptamos fallos de tabla XREF o catálogo /Root roto sin abortar
-        logger.warning(
-            f"[{nombre_archivo}] Parser estricto falló ({type(exc).__name__}). "
-            "Activando sanación de XREF en memoria con motor C++ (pypdfium2)..."
-        )
+    # Phase 2: Routing Decision
+    # If text is sparse (< 1300 chars) but contains images, it's likely a scanned
+    # document or label (e.g., BIOGIBB). Route directly to Vision API.
+    if text_length < 1300 and has_images:
+        logger.info(f"[{filename}] Routed to VISION path (Length: {text_length}).")
+        yield from _via_vision(filepath, filename)
+        return
 
-    # 2. FALLBACK DE SANACIÓN EN MEMORIA (pypdfium2 / Google PDFium C++)
-    # Al igual que Chrome o Preview, PDFium repara tablas XREF corruptas sobre la marcha.
-    try:
-        doc = pdfium.PdfDocument(filepath)
-        for i in range(len(doc)):
-            page = doc[i]
-            text_page = page.get_textpage()
-            texto = text_page.get_text_range()
-            
-            if not texto:
-                continue
-                
-            for linea in texto.splitlines():
-                if (cultivo := CULTIVOS_REGEX.search(linea)) and (dosis := DOSIS_REGEX.search(linea)):
-                    registros_extraidos += 1
-                    yield _crear_registro(nombre_archivo, cultivo.group(0), dosis.group(0), linea)
-                    
-        doc.close()
+    # Phase 3: Deterministic Cascading
+    logger.info(f"[{filename}] Routed to DETERMINISTIC path.")
+    registros = list(_cascada_determinista(filepath, filename))
+    
+    # Validation Gate: Did the deterministic parser find actual dosages?
+    con_dosis = sum(1 for r in registros if r.dosis is not None)
+    
+    if con_dosis >= 1:
+        yield from registros
+    else:
+        logger.warning(f"[{filename}] Deterministic path yielded 0 dosages. Fallback to VISION.")
+        yield from _via_vision(filepath, filename)
+
+
+def _cascada_determinista(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
+    """
+    Applies Regex and Spatial rules to extract tables and aligned columns.
+    """
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                # Extractor 2: Aligned Columns (Tablas sin bordes) -> ODAI §6.5.3.2
+                if REGEX_CULTIVOS.search(line) and (m := REGEX_DOSIS.search(line)):
+                    yield RegistroAtomico(
+                        registro_id=str(uuid.uuid4()),
+                        documento_fuente=filename,
+                        version_corpus=0,
+                        producto="[Extraído Automáticamente]", 
+                        cultivo=line[:m.start()].strip(' .:-'),
+                        dosis=m.group(0),
+                        metodo_extraccion="columnas",
+                        estado_validacion="aprobado", # Deterministic logic is pre-approved
+                        idioma="es"
+                    )
+
+
+def _via_vision(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
+    """
+    ODAI Blueprint §6.5.4: Multimodal LLM literal transcription.
+    Converts PDF pages to PNG using C++ pypdfium2, then calls OpenAI Vision API.
+    """
+    client = OpenAI(api_key=settings.openai_api_key)
+    pdf = pdfium.PdfDocument(filepath)
+    markdown_pages = []
+
+    for i in range(len(pdf)):
+        # 1. Rasterize page to 200 DPI PNG
+        page = pdf[i]
+        bitmap = page.render(scale=200/72) # 200 DPI scaling
+        pil_image = bitmap.to_pil()
         
-        if registros_extraidos > 0:
-            logger.info(f"[{nombre_archivo}] Sanación C++ exitosa. Extraídos {registros_extraidos} registros.")
-            return
+        # Encode image for API payload
+        img_byte_arr = io.BytesIO()
+        pil_image.save(img_byte_arr, format='PNG')
+        base64_image = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    except Exception as exc_pdfium:
-        logger.error(f"[{nombre_archivo}] Fallo en motor C++ PDFium: {str(exc_pdfium)}")
+        # 2. Transcribe via Multimodal LLM
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_VISION},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                ]}
+            ],
+            temperature=0.0 # Force deterministic transcription, NO creativity
+        )
+        markdown_pages.append(response.choices[0].message.content)
 
-    # 3. RUTA DE VISIÓN (ODAI Blueprint §6.5.4 - LLM Multimodal)[cite: 12]
-    # Si las reglas deterministas no logran extraer dosis (e.g., tablas en imágenes estáticas),
-    # se escala a la transcripción multimodal[cite: 12].
-    if registros_extraidos == 0:
-        logger.warning(f"[{nombre_archivo}] 0 dosis encontradas por texto. Escalando a Ruta de Visión (§6.5.4)...")
-        yield from _extraer_por_vision(filepath, nombre_archivo)
-
-
-def _crear_registro(nombre_archivo: str, cultivo: str, dosis: str, condiciones: str) -> RegistroAtomico:
-    """Fábrica de DTO para homogeneizar la creación del Registro Atómico[cite: 12]."""
-    return RegistroAtomico(
-        registro_id=str(uuid.uuid4()),
-        documento_fuente=nombre_archivo,
-        version_corpus=1,
-        producto="Producto Detectado",
-        cultivo=cultivo,
-        dosis=dosis,
-        condiciones=condiciones.strip(),
-        metodo_extraccion="columnas",
-        estado_validacion="aprobado",
-        idioma="es"
-    )
-
-
-def _extraer_por_vision(filepath: str, nombre_archivo: str) -> Iterator[RegistroAtomico]:
-    """
-    Ruta de Visión (ODAI Blueprint §6.5.4)[cite: 12].
-    Placeholder arquitectónico listo para conectar a OpenAI Vision / Gemini Flash 
-    cuando el documento consiste de imágenes escaneadas sin capa de texto.
-    """
-    # En desarrollo local: evitamos lanzar excepción no controlada si la API no está inyectada.
-    # Cuando se ejecute en VPS2 (Airflow), aquí se invoca el cliente multimodal con SYSTEM_VISION[cite: 12].
-    return iter(())
+    # 3. Reprocess transcribed markdown using deterministic text extractors
+    combined_markdown = "\n".join(markdown_pages)
+    for line in combined_markdown.splitlines():
+         if REGEX_CULTIVOS.search(line) and (m := REGEX_DOSIS.search(line)):
+            yield RegistroAtomico(
+                registro_id=str(uuid.uuid4()),
+                documento_fuente=filename,
+                version_corpus=0,
+                producto="[Transcrito por Visión]",
+                cultivo=line[:m.start()].strip(' .|-*'),
+                dosis=m.group(0),
+                metodo_extraccion="vision",
+                estado_validacion="en_revision", # MUST be manually reviewed by Sergio Espinosa
+                idioma="es"
+            )
