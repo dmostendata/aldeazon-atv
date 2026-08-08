@@ -1,6 +1,6 @@
 # tests/test_catalog.py
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from app.services.catalog import resolver_productos_comerciales, construir_carrito_items
 from app.schemas.domain import ProductoComercial
 

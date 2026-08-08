@@ -1,9 +1,10 @@
 # app/services/catalog.py
 import logging
-from typing import List, Optional
+from typing import List
 from sqlalchemy import select, and_, column, table, asc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Pydantic DTOs abstracting the commercial response
 from app.schemas.domain import ProductoComercial, CarritoItem
 
 logger = logging.getLogger("atv.catalog")
@@ -11,6 +12,11 @@ logger = logging.getLogger("atv.catalog")
 # =====================================================================
 # SQLALCHEMY 2.0 CORE TABLE METADATA (SCHEMA: stc2)
 # =====================================================================
+# LARAVEL BRIDGING: 
+# Defining explicit Core tables is equivalent to configuring a raw DB::table()
+# contract without booting full Eloquent ORM models. This eliminates reflection
+# and identity-map overhead in the asyncio event loop, keeping p95 latency low.
+
 stc2_agroquimico = table(
     "agroquimico",
     column("id"),
@@ -26,7 +32,7 @@ stc2_bodega_inventario = table(
     column("agroquimico_id"),
     column("az_catalogo_bodegas_id"),
     column("cantidad_disponible"),
-    column("precio"),
+    column("precio_publico"),
     column("precio_asociado"),
     schema="stc2",
 )
@@ -52,7 +58,7 @@ async def resolver_productos_comerciales(
     and K is the limit of returned rows.
     """
     if not principio_activo or not principio_activo.strip():
-        logger.warning("Catalog resolver called with empty principio_activo.")
+        logger.warning("Catalog resolver invoked with empty principio_activo.")
         return []
 
     # Clean molecule string for case-insensitive LIKE matching
@@ -66,7 +72,7 @@ async def resolver_productos_comerciales(
             stc2_agroquimico.c.ingrediente_activo.label("ingrediente_activo"),
             stc2_bodega_inventario.c.az_catalogo_bodegas_id.label("bodega_id"),
             stc2_bodega_inventario.c.cantidad_disponible,
-            stc2_bodega_inventario.c.precio.label("precio_publico"),
+            stc2_bodega_inventario.c.precio_publico,
             stc2_bodega_inventario.c.precio_asociado,
         )
         .select_from(
@@ -85,13 +91,14 @@ async def resolver_productos_comerciales(
             )
         )
         # Order by lowest price first to favor cost-leadership for cooperative members
-        .order_by(asc(stc2_bodega_inventario.c.precio))
+        .order_by(asc(stc2_bodega_inventario.c.precio_publico))
         .limit(limite)
     )
 
     try:
         # AWAIT NON-BLOCKING I/O:
-        # Yields control of the Python thread until PostgreSQL responds over TCP.
+        # Yields control of the Python thread until MariaDB/PostgreSQL responds over TCP.
+        # This prevents the GIL from blocking other concurrent FastAPI requests.
         result = await session.execute(query)
         rows = result.mappings().all()
 
