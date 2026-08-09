@@ -16,6 +16,8 @@ from app.services.pii_sanitizer import sanitizar_pii, clasificar_intencion
 from app.services.catalog import resolver_productos_comerciales, construir_carrito_items
 from app.schemas.domain import CarritoItem
 
+from app.services.cache_service import semantic_cache
+
 logger = logging.getLogger("atv.rag_orchestrator")
 
 # ODAI Blueprint §6.5.3: Exact dosage regex for groundedness verification
@@ -111,6 +113,38 @@ class ATVRagService:
         
         # Phase 2: Intent Classification
         intencion, lat_clasif = clasificar_intencion(consulta_sanitizada)
+
+        # =================================================================
+        # NEW: Phase 2.5: Redis Semantic Cache Interception
+        # =================================================================
+        # ODAI Blueprint §6.6.6: Only cache informational queries to prevent 
+        # locking in outdated chemical recommendations (RSK-001).
+        version_corpus_actual = 1 # In production, query this from `atv.inventario_archivo`
+        
+        if intencion == "informativa":
+            t_cache = time.perf_counter()
+            cached_data = await semantic_cache.get_cached_response(consulta_sanitizada, version_corpus_actual)
+            
+            if cached_data:
+                lat_cache = int((time.perf_counter() - t_cache) * 1000)
+                # Rehydrate the Pydantic model from the cached dictionary
+                return RAGResult(
+                    consulta_sanitizada=consulta_sanitizada,
+                    respuesta=cached_data["respuesta"],
+                    fuente=cached_data["fuente"],
+                    confianza=cached_data["confianza"],
+                    intencion=intencion,
+                    escalada_hitl=False,
+                    modelo_utilizado="redis_semantic_cache",
+                    registros_usados=cached_data["registros_usados"],
+                    carrito=[], # Do not cache live commercial inventory
+                    tokens_entrada=0,
+                    tokens_salida=0,
+                    lat_sanitizacion_ms=lat_sanitizacion,
+                    lat_clasif_ms=lat_clasif,
+                    lat_retrieval_ms=lat_cache,
+                    lat_llm_ms=0
+                )
         
         # Phase 3: Qdrant Asynchronous Retrieval
         t_ret = time.perf_counter()
@@ -269,6 +303,21 @@ class ATVRagService:
                 sucursal_id=sucursal_id
             )
             carrito = construir_carrito_items(productos_comerciales)
+
+        # =================================================================
+        # NEW: Phase 9: Cache the Final Result
+        # =================================================================
+        if intencion == "informativa" and not escalada_hitl:
+            await semantic_cache.set_cached_response(
+                consulta_sanitizada=consulta_sanitizada,
+                version_corpus=version_corpus_actual,
+                response_payload={
+                    "respuesta": respuesta_texto,
+                    "fuente": fuente_formateada,
+                    "confianza": max_score,
+                    "registros_usados": metadata_list
+                }
+            )
 
         return RAGResult(
             consulta_sanitizada=consulta_sanitizada,

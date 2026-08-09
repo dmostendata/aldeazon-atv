@@ -6,7 +6,7 @@ from sqlalchemy import (
     String, Integer, Numeric, Boolean, Text, TIMESTAMP, 
     ForeignKey, Computed, Index
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
@@ -61,6 +61,9 @@ class Consulta(Base):
     cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
     registros_usados: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSONB, nullable=True)
     version_corpus: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # RSK-NEW-04 Commercial Sales Audit
+    productos_sugeridos_ids: Mapped[Optional[List[int]]] = mapped_column(ARRAY(Integer), default=list)
 
 
 class InventarioArchivo(Base):
