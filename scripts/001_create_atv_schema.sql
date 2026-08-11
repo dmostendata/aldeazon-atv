@@ -62,6 +62,28 @@ CREATE TABLE IF NOT EXISTS atv.inventario_archivo (
     ts_indexado TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS atv.error_log
+(
+    error_id uuid NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    consulta_id uuid,
+    componente character varying(64) COLLATE pg_catalog."default" NOT NULL,
+    excepcion_tipo character varying(128) COLLATE pg_catalog."default" NOT NULL,
+    mensaje text COLLATE pg_catalog."default" NOT NULL,
+    stack_trace text COLLATE pg_catalog."default",
+    resuelto boolean NOT NULL,
+    CONSTRAINT error_log_pkey PRIMARY KEY (error_id),
+    CONSTRAINT error_log_consulta_id_fkey FOREIGN KEY (consulta_id)
+        REFERENCES atv.consulta (consulta_id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL
+) TABLESPACE pg_default;
+
+CREATE INDEX IF NOT EXISTS idx_error_componente_ts
+    ON atv.error_log USING btree
+    (componente COLLATE pg_catalog."default" ASC NULLS LAST, ts ASC NULLS LAST)
+    TABLESPACE pg_default;
+
 -- 4. HIGH-PERFORMANCE SUPERSET BI INDEXES
 -- Covering index for temporal slicing and HITL escalation dashboards
 CREATE INDEX IF NOT EXISTS idx_consulta_ts_hitl 
