@@ -9,31 +9,31 @@ class Settings(BaseSettings):
     Application Configuration Singleton.
     """
     # --- PostgreSQL 18 Traceability Database (VPS3) ---
-    database_url: str = "postgresql+psycopg://aldeazon_user:secret@localhost:5434/atv_qa"
+    database_url: str
     
     # --- Internal VPC Security (App AldeaZON -> ATV Endpoint) ---
-    api_key: str = "aldeazon_internal_app_secret_2026"
+    api_key: str
     
     # --- On-Premise Object Storage (SeaweedFS S3 - VPS3) ---
     # Replaces deprecated Microsoft Graph / SharePoint credentials
-    s3_endpoint_url: str = "http://localhost:8333"
-    s3_access_key: str = "seaweedfs_admin"
-    s3_secret_key: str = "seaweedfs_secret"
-    s3_bucket_corpus: str = "atv-corpus-vigente"
-    s3_region: str = "us-east-1"  # Static fallback for S3 SDK compatibility
+    s3_endpoint_url: str
+    s3_access_key: str
+    s3_secret_key: str
+    s3_bucket_corpus: str
+    s3_region: str
 
     # --- Vector Database (Qdrant 1.9.1 - VPS4) ---
-    qdrant_url: str = "http://localhost:6333"
+    qdrant_url: str
     qdrant_api_key: Optional[str] = None
-    qdrant_collection: str = "atv_corpus"
+    qdrant_collection: str
     
     # --- Semantic Cache & Message Broker (Redis 7 - VPS4) ---
-    redis_url: str = "redis://localhost:6380/3"  # Logical DB 3 reserved for ATV semantic cache
+    redis_url: str
     cache_similarity_threshold: float = 0.95
     cache_ttl_seconds: int = 604800  # 7 days
 
     # --- External LLM Providers & Fallback ---
-    openai_api_key: str = "sk-proj-placeholder"
+    openai_api_key: str
     gemini_api_key: Optional[str] = None
     llm_primary_model: str = "gpt-4o-mini"
     llm_fallback_model: str = "gemini-1.5-flash"

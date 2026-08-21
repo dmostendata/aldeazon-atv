@@ -3,11 +3,18 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, Any, Dict, List
 from sqlalchemy import (
-    String, Integer, Numeric, Boolean, Text, TIMESTAMP, 
+    Column, String, Integer, Numeric, Boolean, Text, TIMESTAMP, 
     ForeignKey, Computed, Index
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY, ENUM
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+intencion_enum = ENUM(
+    'informativa', 'recomendacion', 'fuera_alcance',
+    name='intencion_tipo',
+    schema='atv',
+    create_type=False
+)
 
 class Base(DeclarativeBase):
     """
@@ -33,7 +40,7 @@ class Consulta(Base):
     ts: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
     vendedor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     consulta_sanitizada: Mapped[str] = mapped_column(Text, nullable=False)
-    intencion: Mapped[str] = mapped_column(String(32), nullable=False)
+    intencion = Column(intencion_enum, nullable=False)
     confianza: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False)
     escalada_hitl: Mapped[bool] = mapped_column(Boolean, default=False)
     respuesta: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

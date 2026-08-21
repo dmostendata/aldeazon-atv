@@ -17,6 +17,7 @@ from app.services.catalog import resolver_productos_comerciales, construir_carri
 from app.schemas.domain import CarritoItem
 
 from app.services.cache_service import semantic_cache
+from fastembed import TextEmbedding
 
 logger = logging.getLogger("atv.rag_orchestrator")
 
@@ -97,6 +98,7 @@ class ATVRagService:
     """
     def __init__(self, qdrant_client: AsyncQdrantClient, db_session: AsyncSession) -> None:
         self.qdrant = qdrant_client
+        self.embedding_model = TextEmbedding("intfloat/multilingual-e5-large")
         self.db = db_session
         self.alias_name = settings.qdrant_collection
         
@@ -149,14 +151,18 @@ class ATVRagService:
         # Phase 3: Qdrant Asynchronous Retrieval
         t_ret = time.perf_counter()
         try:
-            search_result = await self.qdrant.query(
+            embedded_result = list(self.embedding_model.embed([consulta_sanitizada]))
+            query_vector = embedded_result[0].tolist()
+
+            # 2. Use .search() for explicit vector lookups, NOT .query()
+            search_result = await self.qdrant.search(
                 collection_name=self.alias_name,
-                query_text=consulta_sanitizada,
+                query_vector=("dense", query_vector),
                 limit=3
             )
         except Exception as exc:
             lat_retrieval = int((time.perf_counter() - t_ret) * 1000)
-            logger.error(f"Async Qdrant retrieval error: {str(exc)}")
+            logger.error(f"Async Qdrant retrieval error: {str(exc)}\n{traceback.format_exc()}")
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
                 respuesta="El servicio de consulta técnica está temporalmente indisponible. Consulta con Asistencia Técnica.",

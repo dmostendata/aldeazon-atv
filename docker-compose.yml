@@ -40,6 +40,24 @@ services:
     volumes:
       - redis_data:/data
 
+  atv-api:
+    image: aldeazon/atv-api:latest
+    ports:
+      - "127.0.0.1:8100:8100"
+    # API workers are lightweight. They handle auth, RAG orchestration, and DB connections.
+    # We can safely run multiple workers here.
+    command: ["gunicorn", "app.main:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8100"]
+
+  # The Isolated Inference Layer
+  atv-embeddings:
+    image: aldeazon/atv-embeddings:latest
+    ports:
+      - "127.0.0.1:8101:8101"
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+
 volumes:
   postgres_data:
   qdrant_data:
