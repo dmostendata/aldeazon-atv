@@ -96,9 +96,9 @@ class ATVRagService:
     """
     Asynchronous RAG Orchestrator handling NLP flow and cross-service coordination.
     """
-    def __init__(self, qdrant_client: AsyncQdrantClient, db_session: AsyncSession) -> None:
+    def __init__(self, qdrant_client: AsyncQdrantClient, embedding_model: TextEmbedding, db_session: AsyncSession) -> None:
         self.qdrant = qdrant_client
-        self.embedding_model = TextEmbedding("intfloat/multilingual-e5-large")
+        self.embedding_model = embedding_model
         self.db = db_session
         self.alias_name = settings.qdrant_collection
         

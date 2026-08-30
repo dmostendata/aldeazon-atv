@@ -16,6 +16,8 @@ from app.services.rag_service import ATVRagService
 from app.schemas.domain import ChatResponse
 from pydantic import BaseModel, Field
 
+from fastembed import TextEmbedding
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("atv.gateway")
 
@@ -41,6 +43,8 @@ class ChatRequest(BaseModel):
     consulta: str = Field(..., min_length=2, max_length=1000)
     sesion_id: str | None = Field(None, description="Idempotencia/sesión")
 
+logger.info("Pre-loading bge-m3 dense embedding model into RAM (Singleton)...")
+embedding_model_singleton = TextEmbedding("intfloat/multilingual-e5-large")
 
 @app.post("/api/v1/consultar", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
 async def procesar_consulta_interna(
@@ -54,7 +58,11 @@ async def procesar_consulta_interna(
     start_time = time.perf_counter()
     
     # 1. Inject connections into the RAG Orchestrator
-    rag_service = ATVRagService(qdrant_client=qdrant_client, db_session=db)
+    rag_service = ATVRagService(
+        qdrant_client=qdrant_client, 
+        embedding_model=embedding_model_singleton,
+        db_session=db
+    )
     result = await rag_service.procesar_consulta(request.consulta, request.sucursal_id)
     
     lat_total = int((time.perf_counter() - start_time) * 1000)

@@ -88,7 +88,7 @@ class InventarioArchivo(Base):
 
     archivo_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     nombre_archivo: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    etag_sharepoint: Mapped[str] = mapped_column(String(128), nullable=False)
+    etag_seaweedfs: Mapped[str] = mapped_column(String(128), nullable=False)
     version_corpus: Mapped[int] = mapped_column(Integer, nullable=False)
     
     # 'NUEVO', 'MODIFICADO', 'RETIRADO', 'INDEXADO', 'ERROR'

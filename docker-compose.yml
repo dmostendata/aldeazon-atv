@@ -36,7 +36,7 @@ services:
     container_name: aldeazon-atv-local-redis-1
     # CORRECT: Left side is macOS host (6380), right side is Redis internal (6379)
     ports:
-      - "6380:6379"
+      - "6379:6379"
     volumes:
       - redis_data:/data
 
