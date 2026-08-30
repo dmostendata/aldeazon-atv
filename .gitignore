@@ -5,6 +5,7 @@
 .env
 .env.backup
 .env.production
+.cache
 absolutkarlos.env
 
 # Python Cache
