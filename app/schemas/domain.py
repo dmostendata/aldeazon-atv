@@ -1,4 +1,5 @@
 # app/schemas/domain.py
+import re
 from typing import Optional, List
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
@@ -44,8 +45,11 @@ class RegistroAtomico(BaseModel):
         Safety Gate: Ensures dosage strings contain explicit area units (ha/mz).
         Prevents false-positive pH or concentration values from passing ingestion.
         """
-        if v and not any(unit in v.lower() for unit in ["/ha", "/mz", "por ha", "por mz"]):
-            raise ValueError(f"Invalid dosage format missing area unit: {v}")
+        if v:
+            # Use regex to ignore whitespace variations between the slash and the unit
+            patron_area = re.compile(r'/(?:\s*)?(ha|mz)\b|por\s+(ha|mz)\b', re.IGNORECASE)
+            if not patron_area.search(v):
+                raise ValueError(f"Invalid dosage format missing area unit: {v}")
         return v
 
     def texto_para_embedding(self) -> str:
