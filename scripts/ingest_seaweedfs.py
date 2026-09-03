@@ -1,5 +1,6 @@
 # scripts/ingest_seaweedfs.py
 import os
+import gc
 import asyncio
 import logging
 import traceback
@@ -27,9 +28,18 @@ logger = logging.getLogger("atv.ingestion")
 
 STAGING_DIR = "/var/www/aldeazon-atv/fixtures/staging"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-COLLECTION_NAME = "atv_corpus_v1"
 ALIAS_NAME = settings.qdrant_collection
 CURRENT_CORPUS_VERSION = 1
+
+# NOTE: previously this was a separate hardcoded constant ("atv_corpus_v1")
+# that only happened to match f"{ALIAS_NAME}_v{CURRENT_CORPUS_VERSION}" by
+# coincidence. Deriving it directly removes that landmine.
+COLLECTION_NAME = f"{ALIAS_NAME}_v{CURRENT_CORPUS_VERSION}"
+
+# Batch size for periodic Qdrant flush. We upsert per-file (see below) but
+# this caps how many text/metadata/id lists we keep resident at once if a
+# single file yields an unusually large number of tuples.
+UPSERT_BATCH_SIZE = 64
 
 offline_async_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 OfflineAsyncSession = async_sessionmaker(offline_async_engine, expire_on_commit=False)
@@ -56,7 +66,7 @@ async def sincronizar_seaweedfs() -> None:
             # SCOPED S3 FETCH
             response = await s3.list_objects_v2(
                 Bucket=settings.s3_bucket_corpus, 
-                Prefix="raw/ostendata/aldeazon-atv/Fichas Técnicas de Productos/"
+                Prefix="raw/ostendata/aldeazon-atv/Fichas Técnicas de Productos/"
             )
             remotos = response.get('Contents', [])
         except ClientError as exc:
@@ -120,11 +130,27 @@ async def sincronizar_seaweedfs() -> None:
             logger.info("SeaweedFS sync & binary downloads complete.")
 
 
+def _ensure_qdrant_collection(qdrant: QdrantClient) -> None:
+    """
+    Idempotent collection setup.
+
+    IMPORTANT: unlike the previous version, this does NOT drop/recreate the
+    collection unconditionally. If the collection already exists (e.g. the
+    previous run was killed partway through), we leave it alone so that
+    points already upserted survive a restart. The collection is only
+    created fresh the first time it's missing.
+    """
+    if not qdrant.collection_exists(COLLECTION_NAME):
+        logger.info(f"Collection '{COLLECTION_NAME}' does not exist yet. Creating it.")
+        qdrant.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=qdrant.get_fastembed_vector_params(),
+        )
+    else:
+        logger.info(f"Collection '{COLLECTION_NAME}' already exists. Upserting incrementally.")
+
+
 def reconstruir_indice_qdrant() -> None:
-    lote_textos: List[str] = []
-    lote_metadata: List[Dict[str, Any]] = []
-    lote_ids: List[str] = []
-    
     db = OfflineSyncSession()
 
     if not os.path.exists(STAGING_DIR):
@@ -135,9 +161,16 @@ def reconstruir_indice_qdrant() -> None:
     archivos_staging = [f for f in sorted(os.listdir(STAGING_DIR)) if f.lower().endswith(".pdf")]
     logger.info(f"Found {len(archivos_staging)} PDF(s) in staging for extraction.")
 
+    qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    qdrant.set_model(EMBEDDING_MODEL)
+    _ensure_qdrant_collection(qdrant)
+
+    total_indexado = 0
+    total_omitido = 0
+
     for filename in archivos_staging:
         filepath = os.path.join(STAGING_DIR, filename)
-        
+
         # MLOps: Prevent MultipleResultsFound by using scalars().first()
         inv_entry = db.execute(
             select(InventarioArchivo)
@@ -149,17 +182,51 @@ def reconstruir_indice_qdrant() -> None:
             logger.warning(f"Skipping known error file: {filename}")
             continue
 
+        # RESUMABILITY: if this file was already successfully indexed in a
+        # prior run (its etag hasn't changed since, otherwise
+        # sincronizar_seaweedfs() would have flipped it to "MODIFICADO"),
+        # don't re-extract or re-upsert it. This is what makes it safe to
+        # simply re-run this script after an OOM kill.
+        if inv_entry and inv_entry.estado == "INDEXADO":
+            logger.info(f"Already indexed, skipping: {filename}")
+            total_omitido += 1
+            continue
+
+        lote_textos: List[str] = []
+        lote_metadata: List[Dict[str, Any]] = []
+        lote_ids: List[str] = []
+
         try:
             extracted_count = 0
             logger.info(f"Extracting atomic records from: {filename}...")
-            
+
             for registro in extraer_desde_pdf(filepath, filename):
                 lote_textos.append(registro.texto_para_embedding())
                 lote_metadata.append(registro.model_dump())
                 lote_ids.append(registro.registro_id)
                 extracted_count += 1
 
-            logger.info(f"Extracted {extracted_count} atomic tuples from '{filename}'.")
+                # Flush in sub-batches so a single huge PDF doesn't hold
+                # everything in memory before hitting Qdrant.
+                if len(lote_ids) >= UPSERT_BATCH_SIZE:
+                    qdrant.add(
+                        collection_name=COLLECTION_NAME,
+                        documents=lote_textos,
+                        metadata=lote_metadata,
+                        ids=lote_ids,
+                    )
+                    lote_textos, lote_metadata, lote_ids = [], [], []
+
+            # Flush whatever remains for this file (< UPSERT_BATCH_SIZE).
+            if lote_ids:
+                qdrant.add(
+                    collection_name=COLLECTION_NAME,
+                    documents=lote_textos,
+                    metadata=lote_metadata,
+                    ids=lote_ids,
+                )
+
+            logger.info(f"Extracted and upserted {extracted_count} atomic tuples from '{filename}'.")
 
             if inv_entry:
                 inv_entry.total_registros_atomicos = extracted_count
@@ -167,10 +234,13 @@ def reconstruir_indice_qdrant() -> None:
                 inv_entry.ts_indexado = datetime.now(timezone.utc)
                 db.commit()
 
+            if extracted_count > 0:
+                total_indexado += 1
+
         except Exception as e:
             logger.error(f"Extraction failed for '{filename}': {e}")
             db.rollback()
-            
+
             error_entry = ErrorLog(
                 componente="ingest_seaweedfs (Airflow DAG)",
                 excepcion_tipo=type(e).__name__,
@@ -182,35 +252,29 @@ def reconstruir_indice_qdrant() -> None:
 
             if inv_entry:
                 inv_entry.estado = "ERROR"
-            
+
             db.commit()
-            continue 
+            continue
+
+        finally:
+            # The VISION fallback path renders pages to images and calls
+            # out to the OpenAI API, which is the most memory-hungry part
+            # of this pipeline. Explicitly drop per-file buffers and force
+            # a collection so memory doesn't accumulate across the loop
+            # (this is what was almost certainly driving the OOM kill).
+            del lote_textos, lote_metadata, lote_ids
+            gc.collect()
 
     db.close()
 
-    if not lote_ids:
-        logger.error("[CRITICAL] Extraction finished with 0 chunks. Qdrant index will NOT be updated.")
+    if total_indexado == 0 and total_omitido == 0:
+        logger.error("[CRITICAL] Extraction finished with 0 chunks indexed and 0 skipped. Qdrant index may be empty.")
         return
 
-    logger.info(f"Indexing {len(lote_ids)} atomic tuples into Qdrant ({COLLECTION_NAME})...")
-    qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
-    qdrant.set_model(EMBEDDING_MODEL)
-
-    if qdrant.collection_exists(COLLECTION_NAME):
-        qdrant.delete_collection(COLLECTION_NAME)
-
-    qdrant.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=qdrant.get_fastembed_vector_params(),
+    logger.info(
+        f"Indexing pass complete. {total_indexado} file(s) newly indexed, "
+        f"{total_omitido} file(s) already up to date and skipped."
     )
-
-    qdrant.add(
-        collection_name=COLLECTION_NAME,
-        documents=lote_textos,
-        metadata=lote_metadata,
-        ids=lote_ids
-    )
-    logger.info(f"Vector indexing complete. {len(lote_ids)} points populated.")
 
 
 async def promover_indice_y_purgar_cache(version_nueva: int) -> None:

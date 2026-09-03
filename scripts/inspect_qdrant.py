@@ -1,16 +1,28 @@
 # scripts/inspect_qdrant.py
 import asyncio
+import sys
 from qdrant_client import AsyncQdrantClient
 from app.core.config import settings
 
 async def inspect_vectors():
     client = AsyncQdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
-    
-    print(f"[*] Inspecting Alias: {settings.qdrant_collection}")
-    
+
+    # Allow inspecting a raw collection name (e.g. "atv_corpus_v1") as a
+    # fallback for when the alias hasn't been promoted yet:
+    #   python -m scripts.inspect_qdrant atv_corpus_v1
+    target = sys.argv[1] if len(sys.argv) > 1 else settings.qdrant_collection
+    print(f"[*] Inspecting: {target}")
+
+    if not await client.collection_exists(target):
+        print(f"[!] '{target}' does not exist as a collection or alias.")
+        print("[*] Collections that DO exist on this Qdrant instance:")
+        for c in (await client.get_collections()).collections:
+            print(f"    - {c.name}")
+        return
+
     try:
         # Fetch the total count of documents in the collection
-        count_result = await client.count(collection_name=settings.qdrant_collection)
+        count_result = await client.count(collection_name=target)
         print(f"[*] Total indexed records (RegistroAtomico chunks): {count_result.count}")
         
         if count_result.count == 0:
@@ -19,7 +31,7 @@ async def inspect_vectors():
 
         # Fetch a sample of 3 records to see what the LLM is actually reading
         records = await client.scroll(
-            collection_name=settings.qdrant_collection,
+            collection_name=target,
             limit=3,
             with_payload=True,
             with_vectors=False
