@@ -66,7 +66,7 @@ async def sincronizar_seaweedfs() -> None:
             # SCOPED S3 FETCH
             response = await s3.list_objects_v2(
                 Bucket=settings.s3_bucket_corpus, 
-                Prefix="raw/ostendata/aldeazon-atv/Fichas Técnicas de Productos/"
+                Prefix="raw/ostendata/aldeazon-atv/Fichas Técnicas de Productos/"
             )
             remotos = response.get('Contents', [])
         except ClientError as exc:
