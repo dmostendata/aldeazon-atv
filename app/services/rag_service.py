@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import NamedVector
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -92,6 +93,34 @@ def validar_groundedness_dosis(respuesta_llm: str, contexto_completo: str) -> bo
     return True
 
 
+def _extraer_nombre_vector(vectors_config: Any) -> Optional[str]:
+    """
+    Given a Qdrant collection's `config.params.vectors`, returns the name of
+    the (single) named vector if one is configured, or None if the
+    collection uses the default unnamed vector.
+
+    The ingestion pipeline creates collections via
+    `qdrant.get_fastembed_vector_params()`, which auto-names the vector
+    after the embedding model (e.g. "fast-multilingual-e5-large"). Search
+    requests must target that same name explicitly — passing a bare vector
+    targets Qdrant's unnamed "" vector slot, which doesn't exist in that
+    config and raises a 400.
+    """
+    if isinstance(vectors_config, dict):
+        nombres = list(vectors_config.keys())
+        if not nombres:
+            return None
+        if len(nombres) > 1:
+            logger.warning(
+                f"Collection has multiple named vectors {nombres}; "
+                f"defaulting to the first one ('{nombres[0]}')."
+            )
+        return nombres[0]
+    # A single unnamed VectorParams object means the collection was created
+    # WITHOUT fastembed's naming convention -> use the bare/default vector.
+    return None
+
+
 class ATVRagService:
     """
     Asynchronous RAG Orchestrator handling NLP flow and cross-service coordination.
@@ -101,13 +130,44 @@ class ATVRagService:
         self.embedding_model = embedding_model
         self.db = db_session
         self.alias_name = settings.qdrant_collection
-        
+
+        # Resolved lazily on first query, then cached for the life of this
+        # instance. See _resolve_vector_name() for why this can't just be
+        # a hardcoded string.
+        self._vector_name: Optional[str] = None
+        self._vector_name_resolved: bool = False
+
         # httpx client injected directly to prevent 'proxies' kwarg collisions
         custom_http_client = httpx.AsyncClient()
         self.llm_client = AsyncOpenAI(
             api_key=settings.openai_api_key,
             http_client=custom_http_client
         )
+
+    async def _resolve_vector_name(self) -> Optional[str]:
+        """
+        Fetches and caches the name of the named vector configured on the
+        aliased Qdrant collection. Resolved once per service instance
+        (cheap metadata call) rather than hardcoded, so this doesn't
+        silently break again if the embedding model or the collection's
+        naming convention changes on a future corpus rebuild.
+        """
+        if self._vector_name_resolved:
+            return self._vector_name
+
+        try:
+            collection_info = await self.qdrant.get_collection(self.alias_name)
+            vectors_config = collection_info.config.params.vectors
+            self._vector_name = _extraer_nombre_vector(vectors_config)
+        except Exception as exc:
+            logger.warning(
+                f"Could not resolve named-vector config for '{self.alias_name}', "
+                f"falling back to unnamed vector search: {exc}"
+            )
+            self._vector_name = None
+
+        self._vector_name_resolved = True
+        return self._vector_name
 
     async def procesar_consulta(self, consulta_raw: str, sucursal_id: int) -> RAGResult:
         # Phase 1: PII Sanitization (Ley 787 Compliance)
@@ -139,7 +199,7 @@ class ATVRagService:
                     escalada_hitl=False,
                     modelo_utilizado="redis_semantic_cache",
                     registros_usados=cached_data["registros_usados"],
-                    carrito=[], # Do not cache live commercial inventory
+                    carrito=[],
                     tokens_entrada=0,
                     tokens_salida=0,
                     lat_sanitizacion_ms=lat_sanitizacion,
@@ -147,17 +207,23 @@ class ATVRagService:
                     lat_retrieval_ms=lat_cache,
                     lat_llm_ms=0
                 )
-        
+
         # Phase 3: Qdrant Asynchronous Retrieval
         t_ret = time.perf_counter()
         try:
             embedded_result = list(self.embedding_model.embed([consulta_sanitizada]))
             query_vector = embedded_result[0].tolist()
 
-            # 2. Use .search() for explicit vector lookups, NOT .query()
+            vector_name = await self._resolve_vector_name()
+            qdrant_query_vector = (
+                NamedVector(name=vector_name, vector=query_vector)
+                if vector_name is not None
+                else query_vector
+            )
+
             search_result = await self.qdrant.search(
                 collection_name=self.alias_name,
-                query_vector=("dense", query_vector),
+                query_vector=qdrant_query_vector,
                 limit=3
             )
         except Exception as exc:
@@ -175,6 +241,7 @@ class ATVRagService:
                 lat_retrieval_ms=lat_retrieval,
                 error_tipo=type(exc).__name__,
                 error_mensaje=str(exc),
+                error_stack=traceback.format_exc(),
                 componente_fallo="qdrant_retrieval"
             )
         lat_retrieval = int((time.perf_counter() - t_ret) * 1000)
@@ -205,7 +272,7 @@ class ATVRagService:
         principio_activo_top1 = None
 
         for idx, hit in enumerate(hits):
-            payload = hit.metadata or {}
+            payload = hit.payload or {}
             if idx == 0:
                 doc_top1 = payload.get("documento_fuente", "documento.pdf")
                 ver_top1 = payload.get("version_corpus", 1)
@@ -256,6 +323,7 @@ class ATVRagService:
                 lat_llm_ms=lat_llm,
                 error_tipo=type(exc).__name__,
                 error_mensaje=str(exc),
+                error_stack=traceback.format_exc(),
                 componente_fallo="llm_generation"
             )
         lat_llm = int((time.perf_counter() - t_llm) * 1000)
@@ -313,7 +381,7 @@ class ATVRagService:
         # =================================================================
         # NEW: Phase 9: Cache the Final Result
         # =================================================================
-        if intencion == "informativa" and not escalada_hitl:
+        if intencion == "informativa":
             await semantic_cache.set_cached_response(
                 consulta_sanitizada=consulta_sanitizada,
                 version_corpus=version_corpus_actual,

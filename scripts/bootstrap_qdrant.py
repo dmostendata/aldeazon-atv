@@ -13,7 +13,7 @@ async def bootstrap_vector_db():
     base_collection = f"{settings.qdrant_collection}_v1"
 
     try:
-        # Enforce idempotency: Verify existence before creating (similar to Laravel's Schema::hasTable)
+        # Enforce idempotency: Verify existence before creating
         if not await client.collection_exists(collection_name=base_collection):
             logger.info(f"Creating collection: {base_collection} (1024-dim)...")
             await client.create_collection(

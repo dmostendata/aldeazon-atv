@@ -1,6 +1,4 @@
 # scripts/test_extractor.py
-import re
-import pdfplumber
 import os
 import sys
 import logging

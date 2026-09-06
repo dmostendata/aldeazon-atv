@@ -32,6 +32,53 @@ Eres un transcriptor de documentos técnicos agrícolas. Recibes la imagen de un
 4. No agregues texto que no esté en la imagen. Nada de introducciones ni conclusiones propias.
 """.strip()
 
+def _resolver_nombre_producto(client: OpenAI, texto_fuente: str, filename: str) -> str:
+    """
+    Determines the commercial product name for a technical sheet from its
+    extracted text/markdown.
+
+    WHY THIS EXISTS: both extraction paths used to hardcode a placeholder
+    ("[Transcrito por Visión]" / "[Extraído Automáticamente]") instead of
+    the real brand name. Since texto_para_embedding() puts the product name
+    first in every embedded chunk, that placeholder was identical across
+    every document in the corpus and dominated/polluted similarity search —
+    retrieval ended up matching on crop/dosage text instead of the actual
+    product, causing wrong documents to be retrieved for product-specific
+    queries.
+
+    Called ONCE per file (not per page/line), so the added cost is one
+    small text completion per document, not per chunk.
+    """
+    fragmento = texto_fuente[:4000]  # product name always appears early on
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": (
+                    "Extrae ÚNICAMENTE el nombre comercial del producto agrícola "
+                    "descrito en esta ficha técnica (ej. 'Engorlid', 'Consento 45 SC'). "
+                    "Responde solo con el nombre exacto, sin explicaciones ni comillas."
+                )},
+                {"role": "user", "content": fragmento}
+            ],
+            temperature=0.0,
+            max_tokens=20
+        )
+        nombre = (response.choices[0].message.content or "").strip().strip('"').strip("'")
+        if nombre and len(nombre) >= 2:
+            return nombre
+    except Exception as exc:
+        logger.warning(f"[{filename}] Product-name resolution failed, using filename fallback: {exc}")
+
+    # Last-resort fallback: derive something readable from the filename
+    # instead of a dead placeholder that would pollute every embedding
+    # from this document identically.
+    guess = re.sub(r'\.pdf$', '', filename, flags=re.IGNORECASE)
+    guess = re.sub(r'(?i)\b(ficha[\s_-]*t[eé]cnica|hoja[\s_-]*de[\s_-]*seguridad|ft|tds|msds)\b', '', guess)
+    guess = re.sub(r'[_\-\[\]\(\)0-9]+', ' ', guess).strip()
+    return guess or "Producto sin identificar"
+
+
 def extraer_desde_pdf(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
     text_length = 0
     has_images = False
@@ -61,22 +108,39 @@ def extraer_desde_pdf(filepath: str, filename: str) -> Iterator[RegistroAtomico]
         yield from _via_vision(filepath, filename)
 
 def _cascada_determinista(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
+    coincidencias = []  # (cultivo, dosis) pairs found across all pages
+    texto_paginas = []
+
     with pdfplumber.open(filepath) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
+            texto_paginas.append(text)
             for line in text.splitlines():
                 if REGEX_CULTIVOS.search(line) and (m := REGEX_DOSIS.search(line)):
-                    yield RegistroAtomico(
-                        registro_id=str(uuid.uuid4()),
-                        documento_fuente=filename,
-                        version_corpus=1,
-                        producto="[Extraído Automáticamente]", 
-                        cultivo=line[:m.start()].strip(' .:-|'),
-                        dosis=m.group(0),
-                        metodo_extraccion="columnas",
-                        estado_validacion="aprobado", 
-                        idioma="es"
-                    )
+                    coincidencias.append((line[:m.start()].strip(' .:-|'), m.group(0)))
+
+    if not coincidencias:
+        return
+
+    client = OpenAI(api_key=settings.openai_api_key)
+    producto = _resolver_nombre_producto(client, "\n".join(texto_paginas), filename)
+
+    for cultivo, dosis in coincidencias:
+        yield RegistroAtomico(
+            registro_id=str(uuid.uuid4()),
+            documento_fuente=filename,
+            version_corpus=1,
+            producto=producto,
+            cultivo=cultivo,
+            dosis=dosis,
+            metodo_extraccion="columnas",
+            # Previously "aprobado" (auto-approved, no human review) on the
+            # assumption the placeholder producto would never be trusted
+            # downstream. Now that producto is an LLM-inferred real name,
+            # it deserves the same review gate as the vision path.
+            estado_validacion="en_revision",
+            idioma="es"
+        )
 
 def _via_vision(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
     client = OpenAI(api_key=settings.openai_api_key)
@@ -108,18 +172,32 @@ def _via_vision(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
                 logger.error(f"[{filename}] Vision API Error on page {i}: {exc}")
 
     combined_markdown = "\n".join(markdown_pages)
+
+    coincidencias = []
     for line in combined_markdown.splitlines():
         clean_line = line.replace('|', ' ').strip()
         if REGEX_CULTIVOS.search(clean_line) and (m := REGEX_DOSIS.search(clean_line)):
-            yield RegistroAtomico(
-                registro_id=str(uuid.uuid4()),
-                documento_fuente=filename,
-                version_corpus=1,
-                producto="[Transcrito por Visión]",
-                cultivo=clean_line[:m.start()].strip(' .|-*'),
-                dosis=m.group(0),
-                condiciones=clean_line[m.end():].strip(' .|-*') or None,
-                metodo_extraccion="vision",
-                estado_validacion="en_revision",
-                idioma="es"
-            )
+            coincidencias.append((
+                clean_line[:m.start()].strip(' .|-*'),
+                m.group(0),
+                clean_line[m.end():].strip(' .|-*') or None,
+            ))
+
+    if not coincidencias:
+        return
+
+    producto = _resolver_nombre_producto(client, combined_markdown, filename)
+
+    for cultivo, dosis, condiciones in coincidencias:
+        yield RegistroAtomico(
+            registro_id=str(uuid.uuid4()),
+            documento_fuente=filename,
+            version_corpus=1,
+            producto=producto,
+            cultivo=cultivo,
+            dosis=dosis,
+            condiciones=condiciones,
+            metodo_extraccion="vision",
+            estado_validacion="en_revision",
+            idioma="es"
+        )
