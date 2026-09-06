@@ -37,6 +37,22 @@ REGEX_RIESGO = re.compile(
     re.IGNORECASE
 )
 
+# GUARDRAIL: es_core_news_sm (the small Spanish NER model, chosen here for
+# its ~15MB footprint) frequently misclassifies capitalized interrogative/
+# functional words as PERSON entities -- most often the first word of a
+# question, since capitalization is one of its strongest signals for
+# proper nouns. Observed in production: "¿Cuáles son las dosis..." had
+# "Cuáles" tagged as PER and blanked to "[NOMBRE]", corrupting the query
+# before it ever reached retrieval or the LLM. This is a cheap, targeted
+# guard against that specific failure mode -- it does not fix the model's
+# general accuracy, just excludes known-safe words that are never PII.
+PALABRAS_NO_PII = {
+    "cual", "cuales", "cuál", "cuáles", "que", "qué", "como", "cómo",
+    "cuando", "cuándo", "donde", "dónde", "cuanto", "cuánto",
+    "cuantos", "cuántos", "cuanta", "cuánta", "cuantas", "cuántas",
+    "quien", "quién", "quienes", "quiénes",
+}
+
 
 def sanitizar_pii(texto: str) -> Tuple[str, int]:
     """
@@ -52,10 +68,21 @@ def sanitizar_pii(texto: str) -> Tuple[str, int]:
     # 2. Heuristic scrub (NER) for proper names
     if nlp:
         doc = nlp(texto_seguro)
-        for ent in doc.ents:
-            if ent.label_ == "PER":
-                # Only replace the exact matched string to preserve agronomic context
-                texto_seguro = texto_seguro.replace(ent.text, '[NOMBRE]')
+
+        # Collect (start, end) spans first, filtering out known false
+        # positives, then apply replacements from the END of the string
+        # backwards. Editing by character span -- rather than
+        # str.replace(ent.text, ...) -- means we redact only the exact
+        # occurrence spaCy flagged, not every unrelated occurrence of that
+        # same substring elsewhere in the message.
+        spans_a_redactar = [
+            (ent.start_char, ent.end_char)
+            for ent in doc.ents
+            if ent.label_ == "PER"
+            and ent.text.strip().lower() not in PALABRAS_NO_PII
+        ]
+        for start, end in sorted(spans_a_redactar, reverse=True):
+            texto_seguro = texto_seguro[:start] + '[NOMBRE]' + texto_seguro[end:]
                 
     lat_ms = int((time.perf_counter() - t0) * 1000)
     return texto_seguro, lat_ms
