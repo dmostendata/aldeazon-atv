@@ -240,9 +240,297 @@ Plaintext
     │   │   ├── logger_service.py     # Non-blocking async APM & SLA audit logging
     │   │   └── rag_service.py        # Hybrid RAG, PII Sanitizer, Groundedness Gate & HITL routing
     │   └── main.py                   # FastAPI REST API Gateway (/api/v1/consultar)
+    ├── dags/
+    │   └── dag_ingesta.py            # DAG orquestador en Airflow (VPS2) con delegación SSH a VPS4
     ├── scripts/
+    │   ├── airflow_tasks.py          # Entrypoint CLI de ejecución remota en VPS4 para tareas de Airflow
+    │   ├── bootstrap_qdrant.py       # Idempotent collection bootstrap and alias attachment
+    │   ├── inspect_qdrant.py         # Diagnostic CLI tool for collections, count, and payloads
+    │   ├── sync_dag_airflow.py       # Verificación y copia de dag_ingesta.py de VPS4 a VPS2
+    │   ├── ingest_seaweedfs.py       # Pipeline de ingesta offline y sync SeaweedFS S3 -> Qdrant
     │   └── ingest_sharepoint.py      # Offline synchronization & Qdrant collection builder
     ├── fixtures/                     # Local sample PDFs and test data
     ├── docker-compose.yml            # Local dev topology (Postgres 16, Qdrant 1.9.1, Redis 7)
     ├── requirements.txt              # Pinned Python ecosystem dependencies
     └── README.md                     # System documentation & architectural baseline
+
+## 8\. Qdrant Vector Database Setup & Replication Guide
+
+Para replicar o desplegar la configuración del vector store en una nueva instancia de Qdrant:
+
+### 8.1. Especificación Técnica de la Colección
+
+* **Colección base:** `atv_corpus_v1`
+* **Alias activo:** `atv_corpus` (referenciado en `.env` mediante `QDRANT_COLLECTION`).
+* **Modelo de Embeddings:** `intfloat/multilingual-e5-large` (manejado vía FastEmbed).
+* **Tipo de vector:** Vector denso único (**Single Dense Vector**). *No utiliza vectores dispersos (sparse vectors).*
+* **Nombre del vector:** `fast-multilingual-e5-large` *(nomenclatura requerida por FastEmbed).*
+* **Dimensiones:** `1024`
+* **Métrica de distancia:** `Cosine`
+* **Almacenamiento de payload:** `on_disk_payload: true`
+* **Parámetros HNSW:** `m: 16`, `ef_construct: 100`
+
+---
+
+### 8.2. Creación vía Dashboard Web de Qdrant
+
+En la interfaz gráfica (`http://<HOST>:6333/dashboard#/collections`):
+
+1. **What'\''s your use case?**: Seleccionar `Global search`.
+2. **What to use for search?**: Seleccionar `Simple Single embedding` (o `Custom`), **no** seleccionar `Simple Hybrid Search`.
+3. **Collection Name**: `atv_corpus_v1`
+4. **Vector name**: `fast-multilingual-e5-large`
+5. **Dimensions**: `1024`
+6. **Choose metric**: `Cosine`
+7. Crear la colección y posteriormente asignar el alias `atv_corpus`.
+
+---
+
+### 8.3. Creación automatizada vía API REST (`curl`)
+
+```bash
+# 1. Crear colección base
+curl -X PUT "http://<HOST>:6333/collections/atv_corpus_v1" \
+  -H "Content-Type: application/json" \
+  -H "api-key: <TU_QDRANT_API_KEY>" \
+  -d '{
+    "vectors": {
+      "fast-multilingual-e5-large": {
+        "size": 1024,
+        "distance": "Cosine"
+      }
+    },
+    "on_disk_payload": true,
+    "hnsw_config": {
+      "m": 16,
+      "ef_construct": 100
+    }
+  }'
+
+# 2. Asociar el Alias atv_corpus
+curl -X POST "http://<HOST>:6333/collections/aliases" \
+  -H "Content-Type: application/json" \
+  -H "api-key: <TU_QDRANT_API_KEY>" \
+  -d '{
+    "actions": [
+      {
+        "create_alias": {
+          "collection_name": "atv_corpus_v1",
+          "alias_name": "atv_corpus"
+        }
+      }
+    ]
+  }'
+```
+
+---
+
+### 8.4. Inicialización y Diagnóstico con Scripts Python
+
+El proyecto incluye utilidades CLI listas para validar y poblar el nuevo servidor:
+
+```bash
+# Inicializar la colección y asociar alias de forma idempotente
+python3 -m scripts.bootstrap_qdrant
+
+# Inspeccionar el estado de la colección, conteo de vectores y muestras de payload
+python3 -m scripts.inspect_qdrant
+```
+
+---
+
+### 8.5. Variables de Entorno (`.env`)
+
+Asegurar que el archivo `.env` apunte al nuevo host:
+
+```ini
+QDRANT_URL="http://<HOST_O_IP>:6333"
+QDRANT_API_KEY="<TU_API_KEY>"
+QDRANT_COLLECTION="atv_corpus"
+```
+
+## 9\. Airflow Orchestrator & Multi-VPS DAG Synchronization (VPS4 ↔ VPS2)
+
+El pipeline de ingesta offline está orquestado por **Apache Airflow**, el cual se ejecuta en un servidor dedicado (**VPS2**), mientras que el código base de la aplicación y extracción reside en **VPS4**.
+
+### 9.1. Topología de Red Privada (`10.0.0.0/24`)
+
+Toda la comunicación entre servidores se realiza a través de la red local privada de alta velocidad (latencia $< 1\text{ ms}$), sin exponer tráfico a internet:
+
+| Servidor | Rol en la Arquitectura | IP Interna | Servicios & Puertos |
+| :--- | :--- | :--- | :--- |
+| **VPS4** | API Gateway, RAG Service, Cómputo IA & Extracción (Servidor Local) | `10.0.0.15` | OpenSSH (`5775`), FastAPI (`8100`), Código ATV (`/var/www/aldeazon-atv`), venv Python 3.12 |
+| **VPS2** | Orquestador Airflow (DAG Scheduler, API & Workers) | `10.0.0.13` | OpenSSH (`9959`), Airflow UI (`8080`), Docker (`semillero_airflow`, Python 3.10) |
+| **VPS3** | Capa de Persistencia & Datalake | `10.0.0.14` | PostgreSQL (`5432`), Qdrant Vector DB (`6333`), SeaweedFS S3 (`8333`) |
+
+---
+
+### 9.2. Emparejamiento Seguro SSH Bidireccional entre VPS4 y VPS2
+
+Para garantizar que la orquestación y la transferencia de archivos operen de forma desatendida y sin contraseñas interactivas:
+
+1. **De VPS4 hacia VPS2 (Sincronización de DAGs):**
+   * VPS4 cuenta con una clave SSH de cluster en `~/.ssh/id_cluster` (`ed25519`).
+   * La clave pública está autorizada en `~/.ssh/authorized_keys` del usuario `ostendata` en `10.0.0.13:9959`.
+   * Permite ejecutar SCP y comandos de Docker en VPS2 desde scripts de despliegue.
+
+2. **De VPS2 (Contenedor Airflow) hacia VPS4 (Despacho de Tareas de Ingesta):**
+   * Dentro del contenedor `semillero_airflow`, la clave privada reside en `/opt/airflow/dags/.id_cluster` (`chmod 600`).
+   * La clave pública está registrada en `~/.ssh/authorized_keys` de VPS4 (`10.0.0.15:5775`).
+   * Permite a las tareas de Airflow despachar comandos de ejecución hacia VPS4 mediante SSH BatchMode sin intervención manual.
+
+3. **Verificación de Enlace Bidireccional:**
+   ```bash
+   # 1. Desde VPS4 hacia VPS2
+   ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 "echo 'VPS4_TO_VPS2_OK'"
+
+   # 2. Desde el contenedor de Airflow en VPS2 hacia VPS4
+   ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+     "docker exec semillero_airflow ssh -p 5775 -i /opt/airflow/dags/.id_cluster -o StrictHostKeyChecking=no ostendata@10.0.0.15 'echo VPS2_TO_VPS4_OK'"
+   ```
+
+---
+
+### 9.3. Despliegue de DAGs en Airflow (VPS2)
+
+En VPS2, Airflow opera en un contenedor Docker (`semillero_airflow`). El directorio de DAGs está mapeado como bind mount:
+* **Host VPS2:** `/apps/airflow/dags/`
+* **Contenedor Airflow:** `/opt/airflow/dags/`
+
+Cualquier archivo `.py` depositado en `/apps/airflow/dags/` es indexado automáticamente por el planificador de Airflow.
+
+---
+
+### 9.4. Script de Sincronización Automática (`sync_dag_airflow.py`)
+
+El script [`scripts/sync_dag_airflow.py`](file:///var/www/aldeazon-atv/scripts/sync_dag_airflow.py) gestiona el ciclo de vida del DAG entre servidores:
+
+1. Valida conectividad SSH hacia VPS2 por la red interna (`10.0.0.13:9959`).
+2. Comprueba si [`dags/dag_ingesta.py`](file:///var/www/aldeazon-atv/dags/dag_ingesta.py) ya existe en `/apps/airflow/dags/`.
+3. Si **no existe** (o si se fuerza la actualización con `--force`), realiza la transferencia segura vía SCP y Docker hacia el directorio de DAGs de Airflow.
+4. Si **ya existe**, omite la transferencia para garantizar idempotencia.
+
+#### Comandos de Ejecución CLI:
+
+```bash
+# Verificación e instalación inicial (idempotente)
+python3 -m scripts.sync_dag_airflow
+
+# Forzar sobrescritura del DAG en VPS2 ante modificaciones en el código
+python3 -m scripts.sync_dag_airflow --force
+
+# Parámetros manuales opcionales
+python3 -m scripts.sync_dag_airflow --key ~/.ssh/id_cluster --dags-dir /apps/airflow/dags
+```
+
+---
+
+### 9.5. Integración en el Pipeline de Ingesta
+
+El proceso principal de ingesta offline ([`scripts/ingest_seaweedfs.py`](file:///var/www/aldeazon-atv/scripts/ingest_seaweedfs.py)) invoca automáticamente esta verificación al inicio de su flujo:
+
+```bash
+python3 -m scripts.ingest_seaweedfs
+```
+
+Antes de escanear o descargar archivos de SeaweedFS, el script valida que Airflow en VPS2 tenga el DAG disponible para orquestar las tareas subsecuentes.
+
+---
+
+### 9.6. Variables de Entorno (`.env`)
+
+Configuración correspondiente en el archivo [`.env`](file:///var/www/aldeazon-atv/.env):
+
+```ini
+# AIRFLOW SERVER (VPS2 - Red Interna)
+AIRFLOW_HOST="10.0.0.13"
+AIRFLOW_PORT="9959"
+AIRFLOW_USER="ostendata"
+AIRFLOW_SSH_KEY="~/.ssh/id_cluster"
+AIRFLOW_DAGS_DIR="/apps/airflow/dags"
+```
+
+---
+
+### 9.7. Arquitectura Desacoplada: Orquestación (VPS2) vs. Cómputo RAG (VPS4)
+
+#### Motivación del Desacoplamiento:
+El contenedor de Airflow en VPS2 (`semillero_airflow`) corre Python 3.10 y alberga servicios compartidos del cluster (OpenMetadata 1.13.1, providers de AWS y Amazon). Instalar directamente en el contenedor las librerías de IA y RAG de ATV (`fastembed`, `qdrant-client`, `pdfplumber`, `pypdfium2`, `spacy`, `torch`/`onnxruntime`) provocaba conflictos destructivos de dependencias (degradación de `boto3`/`botocore`).
+
+#### Principio de Solución:
+* **Airflow (VPS2):** Actúa exclusivamente como **Orquestador Central**. Mantiene el grafo de dependencias, la planificación horaria, el sensor HITL y el control de reintentos.
+* **ATV Engine (VPS4):** Actúa como el **Nodo de Cómputo Especializado**. Ejecuta las fases pesadas dentro de su entorno virtual nativo (`/var/www/aldeazon-atv/.venv`), donde residen todas las dependencias y conexiones directas a Qdrant y PostgreSQL.
+* **Mecanismo de Despacho:** Cada tarea del DAG [`dags/dag_ingesta.py`](file:///var/www/aldeazon-atv/dags/dag_ingesta.py) invoca internamente la función `ejecutar_en_vps4(subcomando)`, la cual ejecuta vía SSH por la red privada:
+  ```bash
+  ssh -p 5775 -i /opt/airflow/dags/.id_cluster ostendata@10.0.0.15 \
+    "cd /var/www/aldeazon-atv && .venv/bin/python -m scripts.airflow_tasks <subcomando>"
+  ```
+
+---
+
+### 9.8. Módulo de Tareas en VPS4 (`scripts/airflow_tasks.py`)
+
+Punto de entrada unificado que expone cada fase del pipeline como un subcomando CLI ejecutable:
+
+| Subcomando | Función Ejecutada | Descripción Operativa |
+| :--- | :--- | :--- |
+| `sincronizar_s3` | `task_sincronizar_s3()` | Conecta a SeaweedFS S3 (`10.0.0.14:8333`), analiza ETags frente a `atv.inventario_archivo`, detecta deltas y descarga los PDFs a `fixtures/staging/`. |
+| `obtener_pendientes` | `task_obtener_pendientes()` | Consulta PostgreSQL e imprime un arreglo JSON con los nombres de archivos en estado `NUEVO` o `MODIFICADO`. |
+| `extraer_pdf <archivo>` | `task_extraer_pdf(filename)` | Ejecuta la extracción dual (determinista vía `pdfplumber` o visión LLM vía `pypdfium2` + GPT-4o-mini), registrando los registros atómicos. |
+| `validar_hitl` | `task_validar_hitl()` | Consulta PostgreSQL para validar si existen registros pendientes de validación humana (`estado IN ('en_revision', 'EN_REVISION')`). Emite `True` o `False`. |
+| `construir_y_promover` | `task_construir_y_promover()` | Genera embeddings densos (`intfloat/multilingual-e5-large`), crea la colección versionada en Qdrant, realiza el cambio atómico de alias (`atv_corpus`) y purga la caché Redis. |
+
+---
+
+### 9.9. Flujo y Ciclo de Vida del DAG (`dags/dag_ingesta.py`)
+
+El DAG `atv_corpus_ingestion_pipeline` se estructura en el siguiente grafo secuencial:
+
+```text
+[t1_sincronizar_s3]
+        │
+        ▼
+[t2_identificar_archivos_pendientes]
+        │
+        ├── (Si no hay archivos pendientes) ──> [AirflowSkipException] ──> [DAG Run: SUCCESS (Skipped)]
+        │
+        └── (Si hay archivos pendientes)
+                │
+                ▼
+        [t3_extraer_pdf]  (Dynamic Task Mapping: expande 1 tarea por PDF)
+                │
+                ▼
+        [t4_sensor_validacion_hitl]  (Sensor: verifica cada 1h resolución humana)
+                │
+                ▼
+        [t5_construir_indice_y_promover]  (Qdrant Index & Alias Switch)
+```
+
+* **Idempotencia y Skip Elegante:** Cuando no se detectan fichas técnicas nuevas o modificadas en S3, la tarea `t2` emite `AirflowSkipException("Sin archivos pendientes para procesar.")`. Airflow salta las fases de extracción, sensor y promoción, concluyendo la ejecución en estado **`success`** sin generar falsas alarmas ni bloqueos.
+
+---
+
+### 9.10. Comandos Operativos de Validación y Monitoreo CLI
+
+Para monitorear o disparar el pipeline directamente desde la terminal de VPS4:
+
+```bash
+# 1. Sincronizar / actualizar el DAG hacia Airflow (VPS2)
+python3 -m scripts.sync_dag_airflow --force
+
+# 2. Disparar manualmente una ejecución del pipeline
+ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+  "docker exec semillero_airflow airflow dags trigger atv_corpus_ingestion_pipeline"
+
+# 3. Listar el historial y estado de ejecuciones del DAG
+ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+  "docker exec semillero_airflow airflow dags list-runs atv_corpus_ingestion_pipeline"
+
+# 4. Inspeccionar el estado individual de cada tarea de una ejecución específica
+ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+  "docker exec semillero_airflow airflow tasks states-for-dag-run atv_corpus_ingestion_pipeline <RUN_ID>"
+
+# 5. Probar una tarea individual en modo de prueba (Dry Run)
+ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+  "docker exec semillero_airflow airflow tasks test atv_corpus_ingestion_pipeline t1_sincronizar_s3"
+```

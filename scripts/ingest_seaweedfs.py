@@ -300,6 +300,13 @@ async def promover_indice_y_purgar_cache(version_nueva: int) -> None:
 
 
 async def main():
+    try:
+        from scripts.sync_dag_airflow import asegurar_dag_en_airflow
+        logger.info("Verificando presencia de dag_ingesta.py en Airflow (VPS2)...")
+        await asyncio.to_thread(asegurar_dag_en_airflow)
+    except Exception as exc:
+        logger.warning(f"Omitiendo sincronización remota de DAG con VPS2: {exc}")
+
     await sincronizar_seaweedfs()
     await asyncio.to_thread(reconstruir_indice_qdrant)
     await promover_indice_y_purgar_cache(version_nueva=CURRENT_CORPUS_VERSION)
