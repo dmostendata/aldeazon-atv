@@ -22,9 +22,18 @@ class SemanticCacheService:
         self.ttl = settings.cache_ttl_seconds
         self.threshold = settings.cache_similarity_threshold
         
-        # Local, in-memory embedding model (does not incur external API costs)
-        # We use the exact same model bound to Qdrant to ensure vector space parity.
-        self.embedding_model = TextEmbedding("intfloat/multilingual-e5-large")
+        # Local, in-memory embedding model (does not incur external API costs).
+        # Lazy: today the cache matches the exact key and never embeds, and loading
+        # a second copy of e5-large next to app.main's singleton cost ~1.3 GB of RAM
+        # (the VPS ran out of memory while re-indexing the corpus, 2026-10-17).
+        self._embedding_model: Optional[TextEmbedding] = None
+
+    @property
+    def embedding_model(self) -> TextEmbedding:
+        if self._embedding_model is None:
+            # Same model bound to Qdrant to ensure vector space parity.
+            self._embedding_model = TextEmbedding("intfloat/multilingual-e5-large")
+        return self._embedding_model
 
     def _embed_query(self, query: str) -> np.ndarray:
         """Synchronous local embedding generation."""

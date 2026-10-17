@@ -46,6 +46,12 @@ class PromptConfig:
     perfil_max_preguntas: int
     alcance_prompt: str
     msg_fuera_alcance: str
+    faq_juez_prompt: str
+    faq_user_prompt_template: str
+    faq_candidatos: int
+    producto_selector_prompt: str
+    producto_linea_template: str
+    msg_producto_tienda: str
 
 
 # Conversor esperado por clave. El tipo lo define el código (no la columna `tipo`),
@@ -74,6 +80,12 @@ _CONVERSORES: Dict[str, Callable[[str], object]] = {
     "perfil_max_preguntas": int,
     "alcance_prompt": str,
     "msg_fuera_alcance": str,
+    "faq_juez_prompt": str,
+    "faq_user_prompt_template": str,
+    "faq_candidatos": int,
+    "producto_selector_prompt": str,
+    "producto_linea_template": str,
+    "msg_producto_tienda": str,
 }
 
 # Placeholders que deben aparecer obligatoriamente en cada plantilla.
@@ -81,6 +93,8 @@ _PLACEHOLDERS_REQUERIDOS: Dict[str, FrozenSet[str]] = {
     "user_prompt_template": frozenset({"contexto", "consulta", "perfil"}),
     "chunk_template": frozenset(),
     "perfil_msg_verificado": frozenset({"resumen"}),
+    "faq_user_prompt_template": frozenset({"respuesta", "consulta", "perfil"}),
+    "producto_linea_template": frozenset({"producto"}),
 }
 
 # Placeholders permitidos: cualquier otro provocaría KeyError en .format().
@@ -88,6 +102,8 @@ _PLACEHOLDERS_PERMITIDOS: Dict[str, FrozenSet[str]] = {
     "user_prompt_template": frozenset({"contexto", "consulta", "perfil"}),
     "chunk_template": frozenset({"documento_fuente", "producto", "cultivo", "dosis", "condiciones"}),
     "perfil_msg_verificado": frozenset({"resumen"}),
+    "faq_user_prompt_template": frozenset({"codigo", "pregunta", "respuesta", "evitar", "productos", "consulta", "perfil"}),
+    "producto_linea_template": frozenset({"producto", "uso", "dosis", "documento"}),
 }
 
 CAMPOS_CHUNK = tuple(sorted(_PLACEHOLDERS_PERMITIDOS["chunk_template"]))
@@ -137,8 +153,8 @@ def construir_prompt_config(filas: Dict[str, str]) -> PromptConfig:
 
     if valores["llm_max_tokens"] <= 0 or valores["retrieval_top_k"] <= 0:
         raise PromptConfigError("'llm_max_tokens' y 'retrieval_top_k' deben ser mayores que 0")
-    if valores["perfil_max_preguntas"] < 0:
-        raise PromptConfigError("'perfil_max_preguntas' no puede ser negativo")
+    if valores["perfil_max_preguntas"] < 0 or valores["faq_candidatos"] < 0:
+        raise PromptConfigError("'perfil_max_preguntas' y 'faq_candidatos' no pueden ser negativos")
 
     return PromptConfig(**valores)
 

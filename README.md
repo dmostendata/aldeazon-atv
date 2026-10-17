@@ -770,10 +770,13 @@ flowchart TD
     F -- sí --> Q[Devuelve la siguiente pregunta<br/>etapa = perfilamiento]
     F -- no --> G
     S -- sí --> G[RAG con perfil<br/>rag_service.py]
-    G --> A{Filtro de alcance<br/>alcance_prompt}
+    G --> FQ[Candidatas de preguntas frecuentes<br/>embedding contra atv.pregunta_frecuente]
+    FQ --> A{Filtro de alcance + juez FAQ<br/>en paralelo}
+    A -- es una pregunta frecuente --> RF[Respuesta aprobada por Asistencia Técnica<br/>adaptada por el LLM]
     A -- fuera --> FA[msg_fuera_alcance]
-    A -- dentro --> C[Caché → Qdrant → umbral → LLM →<br/>abstención → groundedness → carrito]
+    A -- dentro, no es FAQ --> C[Fichas técnicas: caché → Qdrant → umbral → LLM →<br/>abstención → groundedness → carrito]
     C --> RES[Respuesta etapa = respuesta]
+    RF --> RES
 
     subgraph Datos diarios
       M[(VPS1 MariaDB<br/>ssp / catalogos)] -- Semillero 20:00 y 23:30 --> STG[(semillero.stg_cafe<br/>fotos diarias, PII hasheada)]
@@ -855,13 +858,16 @@ Hasta 3 fincas y 5 lotes por finca. Nunca incluye nombres, cédula, teléfonos, 
 | --- | --- | --- | --- |
 | 1 | Sanitización Ley 787 | `sanitizar_pii`: cédula → `[CEDULA]`, teléfono → `[TELEFONO]`, nombres (spaCy) → `[NOMBRE]` | — |
 | 2 | Intención | Regex de riesgo (`dosis`, `qué producto`, `aplicar`, `l/ha`…) → `recomendacion`; si no, `informativa` | — |
-| 3 | **Filtro de alcance** | Llamada aparte con `alcance_prompt` → `{"en_alcance": bool}`. Agro y Aldea Global = dentro; deportes, política, tareas, etc. = fuera | Fuera → `msg_fuera_alcance`, `intencion = fuera_alcance`, sin escalar. Si el filtro falla, **deja pasar** |
+| 3a | **Preguntas frecuentes: candidatas** | Las `faq_candidatos` (5) preguntas de `atv.pregunta_frecuente` más parecidas a la consulta (embedding de la pregunta y sus variantes, en memoria) | Tabla no disponible → sigue sin FAQ |
+| 3b | **Filtro de alcance** ∥ **juez FAQ** | Dos llamadas en paralelo: `alcance_prompt` → `{"en_alcance": bool}` y `faq_juez_prompt` → `{"codigo": "FAQ-xxx" \| null}` (¿pregunta **lo mismo** que una candidata, con cultivo compatible?) | Fuera de alcance y sin FAQ → `msg_fuera_alcance`. El filtro falla → **deja pasar**; el juez falla → **sin FAQ** (fichas) |
+| 3c | **Respuesta de la FAQ** | Si el juez eligió una: busca también las fichas (para el producto) y genera con `system_prompt` + `faq_user_prompt_template` (respuesta aprobada, lo que hay que evitar, `{productos}`); el **selector de producto** corre en paralelo (ver fase 7.5). Fuente `Preguntas frecuentes de Asistencia Técnica, FAQ-xxx`; no escala, sin carrito, **termina aquí** | LLM caído, abstención o dosis que no está en la respuesta aprobada → se entrega la **respuesta aprobada literal** (`modelo = faq_literal`) |
 | 4 | Caché Redis | Solo consultas `informativa`. Clave = consulta + perfil + **huella de los prompts** (editar `prompt_config` invalida lo cacheado). TTL 7 días | — |
 | 5 | Búsqueda Qdrant | Embedding `multilingual-e5-large` de la consulta **+ cultivo principal del perfil**; `retrieval_top_k` fichas | Error → `msg_retrieval_error`, escala |
 | 6 | Umbral de confianza | Score ≥ **0,70** (recomendación) / **0,55** (informativa) | Por debajo → `msg_baja_confianza`, escala sin llamar al LLM |
 | 7 | Generación | `system_prompt` + `user_prompt_template` (`{contexto}`, `{consulta}`, `{perfil}`), `llm_modelo`, timeout 6 s | Error → `msg_llm_error`, escala |
 | 8 | Abstención | Si la respuesta dice *"No tengo esa información en las fichas vigentes…"* → escala a Asistencia Técnica | — |
 | 9 | Groundedness | Toda dosis de la respuesta (`x L/ha`, `kg/mz`…) debe estar **literal** en las fichas recuperadas | Dosis inventada → `msg_groundedness_rechazo`, escala |
+| 7.5 | **Producto AldeaZON** (`producto_service.py`) | En paralelo con la generación, `producto_selector_prompt` elige entre las fichas recuperadas la del **mismo problema y cultivo** (para plagas/enfermedades/malezas el uso de la ficha tiene que nombrar el problema; el tipo debe corresponder) → JSON `{"indice": n\|null}`. El **código** arma la línea `producto_linea_template` con producto, uso y dosis literal de la ficha, o `msg_producto_tienda` si ninguna sirve, y la pone antes de la fuente (si el LLM escribió una, se quita). También en la FAQ y en su respuesta literal | Abstención, rechazo o error: sin línea. Selector caído → mensaje de la tienda |
 | 10 | Carrito | Solo `recomendacion` con sucursal: productos con el ingrediente activo de la ficha top-1, `estado = 1`, stock > 0, del más barato al más caro. **Precio de asociado solo para socios activos verificados** | Error de catálogo → carrito vacío (la respuesta técnica sale igual) |
 | 11 | Guardar en caché | Solo `informativa` | — |
 
@@ -871,10 +877,12 @@ Viven en `atv.prompt_config` (`scripts/004_prompt_vendedor.sql`), se editan en c
 
 * **Rol:** asesor de ventas de AldeaZON, con conocimiento de café y de los productos, atendiendo a un cliente.
 * **Trato:** siempre de **usted**; nunca tutea ("puede", "aplique", "valide"; nunca "puedes", "aplica", "valida"). Cordial y profesional, máximo ~120 palabras.
+* **Primero las preguntas frecuentes:** si la consulta es una de las preguntas aprobadas por Asistencia Técnica (`atv.pregunta_frecuente`), se responde con esa respuesta (puede ordenarla y adaptarla al perfil, no contradecirla ni agregar productos o dosis) y se cita `FAQ-xxx`. Solo si no está en la lista se buscan las fichas técnicas.
 * **Alcance:** solo agro y temas de Aldea Global / AldeaZON (lo decide el filtro de la fase 3, no el LLM de generación: con `gpt-4o-mini` esa decisión dentro del mismo prompt rechazaba preguntas agrícolas cuyas fichas no coincidían).
 * **Solo con las fichas:** responde únicamente con el CONTEXTO; si no está, dice exactamente *"No tengo esa información en las fichas vigentes. Consulte al Área de Asistencia Técnica."*
 * **Nunca inventa** dosis, productos ni condiciones; toda cifra debe estar literal en las fichas.
 * **Fuente obligatoria** al cierre: `[Fuente: documento, versión v]`.
+* **Cierre con producto AldeaZON** (antes de la fuente): no lo escribe el LLM; lo elige el selector y lo arma el código con los datos de la ficha (fase 7.5). Nunca tras la abstención. Historia: con la regla en el prompt (scripts 006–008) gpt-4o-mini recomendó un herbicida para mosca blanca y, endurecida, dejó de recomendar productos que sí servían; 009–010 la pasaron al sistema.
 * **Recomendaciones:** incluye *"Valide esta recomendación con Asistencia Técnica antes de aplicarla."* (esta frase **no** escala la consulta).
 * **Perfil:** adapta cultivo, etapa, terreno, zona y tipo de cliente; si el perfil no alcanza, lo dice y sugiere Asistencia Técnica. Nunca menciona datos personales.
 
@@ -912,6 +920,7 @@ El registro en el catálogo está en `scripts/semillero/004_cafe_perfil_finca.sq
 | `atv.perfil_productor` | Una fila por persona: `cedula_hash`, `telefono_hashes[]`, socio/estado, `tipo_cliente`, sucursal, orgánico, manzanas, comunidad/municipio/departamento, `rubros` (JSON) y `fecha_foto` | DAG | API (por `cedula_hash` indexado) |
 | `atv.perfil_finca` | Fincas activas: altura, pendiente, topografía, suelo, áreas, municipio/departamento | DAG | API |
 | `atv.perfil_lote` | Lotes activos: área, variedad, etapa, siembra, densidad, rendimiento esperado | DAG | API |
+| `atv.pregunta_frecuente` | Preguntas frecuentes de Asistencia Técnica (`scripts/005_create_pregunta_frecuente.sql`): `codigo`, cultivo, categoría, pregunta, `variantes[]`, respuesta aprobada, `respuesta_evitar`, `activo` | `scripts/cargar_preguntas_frecuentes.py` (desde el Excel) | API (embeddings en memoria; se recalculan solos al cambiar la tabla) |
 | `atv.sesion_perfil` | Estado por sesión: `estado` (`perfilando`/`completo`), `perfil` (JSON), preguntas hechas, intentos de identificación, consulta pendiente (sanitizada) | API | API |
 
 La primera carga (2026-10-15) dejó 39.887 personas (22.565 socios activos), 6.304 fincas y 1.835 lotes.
@@ -942,6 +951,12 @@ La primera carga (2026-10-15) dejó 39.887 personas (22.565 socios activos), 6.3
 | `perfil_max_preguntas` | int | Tope de preguntas de perfil (4) |
 | `alcance_prompt` | texto | Filtro de alcance (JSON `{"en_alcance": bool}`) |
 | `msg_fuera_alcance` | texto | Respuesta a consultas fuera de alcance |
+| `faq_juez_prompt` | texto | Juez de preguntas frecuentes (JSON `{"codigo": str\|null}`) |
+| `faq_user_prompt_template` | plantilla | Mensaje al LLM con la respuesta aprobada; `{respuesta}`, `{consulta}`, `{perfil}` obligatorios; `{codigo}`, `{pregunta}`, `{evitar}` permitidos |
+| `producto_selector_prompt` | texto | Selector del producto que cierra la respuesta (JSON `{"indice": int\|null}`) |
+| `producto_linea_template` | plantilla | Línea de cierre; `{producto}` obligatorio, `{uso}`, `{dosis}`, `{documento}` permitidos |
+| `msg_producto_tienda` | texto | Cierre cuando ninguna ficha sirve |
+| `faq_candidatos` | int | Candidatas que recibe el juez (5); `0` desactiva las preguntas frecuentes |
 
 `user_prompt_template` exige además el placeholder `{perfil}`.
 
@@ -953,6 +968,11 @@ Orden usado en producción (2026-10-15 / 17):
 2. **PostgreSQL 10.0.0.14:** regla `pg_hba.conf` para VPS4 → base `semillero` y `GRANT SELECT` de las 12 tablas al rol del ATV (instrucciones para el admin: `docs/instrucciones_admin_vps2_perfil_atv.pdf`).
 3. **ATV:** `scripts/003_create_perfil.sql` y `scripts/004_prompt_vendedor.sql` sobre `staging` **y reinicio inmediato** de `aldeazon-atv.service` (el código y las claves nuevas van juntos: el código viejo no conoce `{perfil}` y el nuevo exige las claves nuevas).
 4. **Carga inicial** (`construir_perfiles`) y publicación del DAG en VPS2.
+5. **Preguntas frecuentes:** `scripts/005_create_pregunta_frecuente.sql` sobre `staging` → `python -m scripts.cargar_preguntas_frecuentes "docs/Preguntas_y_Respuestas_AldeaZON rellenado.xlsx"` (primero con `--dry-run`) → reinicio de la API (código nuevo). Para **actualizar** la lista basta volver a correr el script con el Excel nuevo: hace upsert por ID, desactiva los IDs que ya no vienen y la API recalcula los embeddings en la siguiente consulta, sin reinicio. Se niega a cargar si el Excel trae menos de la mitad de las preguntas activas.
+
+6. **Corpus de fichas v2 (extracción por ficha):** `python -m scripts.reindexar_corpus construir --version 2` llena `atv_corpus_v2` sin tocar el alias (la API sigue en v1); `probar --version 2 "consulta" ...` compara v1 y v2; `promover --version 2` actualiza `atv.inventario_archivo`, mueve el alias `atv_corpus` → `atv_corpus_v2` y vacía Redis. v1 no se borra: volver atrás = `promover --version 1`. Reporte por archivo en `fixtures/reindex_v2.json`. El build carga su propia copia de e5 (~2,1–2,4 GB de RSS): correrlo con la API ya liberada de la copia duplicada del modelo (`cache_service.py` ahora la carga solo si se usa) y vigilando la RAM.
+
+**Extracción por ficha** (`app/services/extractor_ficha.py`, desde v2; la ingesta diaria la usa cuando el alias apunta a v2 o más, ver `ingest_seaweedfs.version_vigente`): texto del PDF (o transcripción por visión si casi no tiene texto) → una llamada al LLM que devuelve producto, tipo, descripción, precauciones y todos los usos (cultivo, objetivo, dosis, condiciones) → **anclaje**: cada cifra de una dosis debe estar en la ficha y su unidad (`L/ha`, `ml`...) también; si no, la dosis se descarta y el uso queda sin cifra → un registro por uso + uno general por ficha. Las dosis sin unidad de área (por litro, bomba, planta) van a `condiciones` (`RegistroAtomico.dosis` sigue exigiendo /ha o /mz). Resultado al 2026-10-17: 141/142 fichas con registros, 962 registros (v1: 68 fichas, 152), 478 con dosis por ha/mz, 138 productos.
 
 Comprobaciones útiles:
 
@@ -961,6 +981,9 @@ Comprobaciones útiles:
 SELECT max(fecha_foto), count(*), count(*) FILTER (WHERE es_asociado) FROM atv.perfil_productor;
 -- staging: sesiones del día por estado
 SELECT estado, count(*) FROM atv.sesion_perfil WHERE ts_creado::date = current_date GROUP BY 1;
+-- staging: qué preguntas frecuentes se están usando
+SELECT registros_usados->0->>'codigo' AS faq, count(*) FROM atv.consulta
+ WHERE modelo LIKE '%faq%' AND ts::date = current_date GROUP BY 1 ORDER BY 2 DESC;
 -- staging: consultas fuera de alcance y escaladas
 SELECT intencion, escalada_hitl, count(*) FROM atv.consulta WHERE ts::date = current_date GROUP BY 1, 2;
 ```
@@ -970,4 +993,9 @@ SELECT intencion, escalada_hitl, count(*) FROM atv.consulta WHERE ts::date = cur
 * **Carrito vacío:** `catalog.py` consulta `stc2.agroquimico.ingrediente_activo` y `stc2.az_bodega_inventario`, pero esas tablas no están en la base `staging` y en el origen `agroquimico` no tiene `ingrediente_activo`. Falta definir de dónde sale el ingrediente activo y traer el catálogo por Semillero (proyecto `insumos`).
 * **Turnos de perfilamiento** no quedan en `atv.consulta` (solo en `atv.sesion_perfil`).
 * **Una vez completo**, el perfil de la sesión ya no se actualiza con lo que el usuario diga después (se responde con el perfil acumulado).
-* El filtro de alcance agrega ~0,5 s por consulta.
+* **Búsqueda de fichas:** el cultivo del perfil se suma ("… en café") solo si la consulta no nombra un cultivo ni un producto del corpus (`texto_de_busqueda`). La forma anterior (" Cultivo: café.") traía fertilizantes en vez de los fungicidas de roya con el corpus v2.
+* **Calidad de la extracción v2:** hay usos con el nombre científico del cultivo como "objetivo" (p. ej. KNIGHT 72 SC → "Coffea arabica") o cultivos mal leídos ("Café de zacate" en RUMBA 28 SC). Los registros están `en_revision`; conviene que Asistencia Técnica revise `fixtures/reindex_v2.json`.
+* El filtro de alcance y el juez de preguntas frecuentes (en paralelo) agregan ~0,5 s por consulta.
+* **Pregunta frecuente vs. dosis puntual:** el juez tiende a asignar a la FAQ general consultas más específicas (p. ej. *"¿qué dosis de Opera por manzana para roya?"* → FAQ-001, que no da dosis y pide confirmar la roya). La respuesta es segura pero no busca la dosis en la ficha.
+* **Corpus v1** (extracción por línea, `extractor.py`): solo guardaba líneas con un cultivo de una lista fija de 14 y una dosis x/ha|mz en la misma línea; 74 de 142 fichas quedaron en ERROR (fertilizantes, tablas partidas, dosis por litro). Lo corrige v2 (ver 11.11, paso 6). `AF YaraBela NITROMAG 27_Costa Rica.pdf` está dañado en SeaweedFS (no es un PDF válido).
+* Las columnas *Dato crítico*, *Nivel de riesgo*, *Producto(s)* y *Fuente* del Excel vienen vacías: se cargan, pero hoy no aportan nada a la respuesta.

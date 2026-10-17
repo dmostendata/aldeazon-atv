@@ -1,6 +1,7 @@
 # app/services/rag_service.py
 import re
 import json
+import asyncio
 import time
 import hashlib
 import logging
@@ -19,6 +20,8 @@ from app.services.pii_sanitizer import sanitizar_pii, clasificar_intencion
 from app.services.catalog import resolver_productos_comerciales, construir_carrito_items
 from app.services.prompt_config import cargar_prompt_config, CAMPOS_CHUNK, PromptConfig
 from app.services.perfil_cliente import PerfilUsuario
+from app.services.faq_service import Candidata, elegir_faq, indice_faq
+from app.services.producto_service import cerrar_con_producto, elegir_producto, linea_producto
 from app.schemas.domain import CarritoItem
 
 from app.services.cache_service import semantic_cache
@@ -41,6 +44,47 @@ REGEX_ABSTENCION = re.compile(
     re.IGNORECASE
 )
 
+# Cultivos que, si la consulta los nombra, hacen innecesario sumar el del perfil a la búsqueda.
+REGEX_CULTIVO_EN_CONSULTA = re.compile(
+    r'\b(caf[eé]s?|cafetal\w*|cafeto|ma[ií]z|milpa|frijol\w*|tomate\w*|chiles?|pimient\w+|papas?|repollo\w*|'
+    r'cebolla\w*|hortaliza\w*|lechuga\w*|zanahoria\w*|br[oó]coli|pepino\w*|mel[oó]n\w*|sand[ií]a\w*|'
+    r'arroz|sorgo|soya|man[ií]|cacao\w*|banano\w*|pl[aá]tano\w*|c[ií]tric\w+|naranj\w+|lim[oó]n\w*|'
+    r'aguacate\w*|pasto\w*|potrero\w*|ganado|vacas?|almácigo\w*|almacigo\w*|vivero\w*|ca[ñn]a)\b',
+    re.IGNORECASE,
+)
+# Siglas de formulación que no forman parte del nombre que dice el cliente ("Mancuerna Plus 28 SE").
+_FORMULACIONES = {"sc", "ec", "sl", "wp", "wg", "se", "od", "gr", "gb", "sp", "fs", "ew", "cs", "ft", "tds"}
+TTL_PRODUCTOS_S = 3600
+_NOMBRES_GENERICOS = {"insecticida", "fungicida", "herbicida", "fertilizante", "semilla", "foliar", "abono", "producto"}
+
+
+def _clave_nombre(texto: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", texto.lower())
+
+
+def nombre_corto_producto(producto: str) -> str:
+    """'MANCUERNA PLUS 28 SE' -> 'mancuernaplus'; 'ROOT-PLUS' -> 'rootplus'."""
+    palabras = [w for w in re.split(r"[\s\-_/®™]+", producto or "")
+                if w and not any(ch.isdigit() for ch in w) and w.lower() not in _FORMULACIONES]
+    return _clave_nombre("".join(palabras))
+
+
+def texto_de_busqueda(consulta: str, cultivo: Optional[str], productos: set) -> str:
+    """
+    Suma el cultivo del perfil ("... en café") solo si la consulta no nombra ya un cultivo
+    ni un producto. Medido con el corpus v2 (2026-10-17): "¿qué tiene para la roya?" + café
+    trae los fungicidas de roya; pero sumarlo a "mosca blanca en tomate" o a "¿cuánto Root
+    Plus...?" trae productos de café. La forma vieja (" Cultivo: café.") traía fichas de
+    fertilizantes cuyo texto es casi solo "Cultivo: café.".
+    """
+    if not cultivo or REGEX_CULTIVO_EN_CONSULTA.search(consulta):
+        return consulta
+    clave = _clave_nombre(consulta)
+    if any(nombre in clave for nombre in productos):
+        return consulta
+    return f"{consulta} en {cultivo}"
+
+
 UMBRAL_CONFIANZA: Dict[str, float] = {
     "informativa": settings.confidence_threshold_informational,
     "recomendacion": settings.confidence_threshold_recommendation,
@@ -48,6 +92,9 @@ UMBRAL_CONFIANZA: Dict[str, float] = {
 
 # System prompt, plantillas, mensajes de fallback y parámetros LLM viven en
 # atv.prompt_config (ver app/services/prompt_config.py). Se leen en cada consulta.
+
+
+_CACHE_PRODUCTOS: Optional[tuple] = None  # (monotonic, set de nombres cortos)
 
 
 class RAGResult(BaseModel):
@@ -171,6 +218,56 @@ class ATVRagService:
         self._vector_name_resolved = True
         return self._vector_name
 
+    async def _nombres_productos(self) -> set:
+        """Nombres cortos de los productos del corpus (para texto_de_busqueda). Caché por proceso, 1 h."""
+        global _CACHE_PRODUCTOS
+        if _CACHE_PRODUCTOS and time.monotonic() - _CACHE_PRODUCTOS[0] < TTL_PRODUCTOS_S:
+            return _CACHE_PRODUCTOS[1]
+        nombres, offset = set(), None
+        try:
+            while True:
+                puntos, offset = await self.qdrant.scroll(
+                    self.alias_name, limit=500, offset=offset, with_payload=["producto"], with_vectors=False
+                )
+                nombres.update(nombre_corto_producto(str((p.payload or {}).get("producto") or "")) for p in puntos)
+                if offset is None:
+                    break
+        except Exception as exc:
+            logger.warning(f"Could not list corpus products ({type(exc).__name__}): {exc}")
+            return _CACHE_PRODUCTOS[1] if _CACHE_PRODUCTOS else set()
+        # Nombres muy cortos o genéricos (hay una ficha cuyo "producto" es "INSECTICIDA") darían falsos positivos
+        nombres = {n for n in nombres if len(n) >= 5 and n not in _NOMBRES_GENERICOS}
+        _CACHE_PRODUCTOS = (time.monotonic(), nombres)
+        return nombres
+
+    async def _buscar_fichas(self, consulta: str, cultivo: Optional[str], top_k: int) -> list:
+        """Fichas técnicas más parecidas en Qdrant (consulta + cultivo del perfil si hace falta). Lanza si Qdrant falla."""
+        texto_busqueda = texto_de_busqueda(consulta, cultivo, await self._nombres_productos()) if cultivo else consulta
+        query_vector = list(self.embedding_model.embed([texto_busqueda]))[0].tolist()
+        vector_name = await self._resolve_vector_name()
+        qdrant_query_vector = (
+            NamedVector(name=vector_name, vector=query_vector) if vector_name is not None else query_vector
+        )
+        return list(await self.qdrant.search(
+            collection_name=self.alias_name, query_vector=qdrant_query_vector, limit=top_k
+        ))
+
+    async def _generar(self, user_prompt: str, cfg: PromptConfig) -> tuple:
+        """(texto, tokens_entrada, tokens_salida) de la generación. Lanza si el LLM falla."""
+        response = await self.llm_client.chat.completions.create(
+            model=cfg.llm_modelo,
+            messages=[
+                {"role": "system", "content": cfg.system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=cfg.llm_temperature,
+            max_tokens=cfg.llm_max_tokens,
+            timeout=settings.llm_timeout_seconds,
+        )
+        usage = response.usage
+        return (response.choices[0].message.content.strip(),
+                usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)
+
     async def _en_alcance(self, consulta_sanitizada: str, cfg: PromptConfig) -> bool:
         """True if the query is about agriculture or Aldea Global. Fails open (True) on any error."""
         try:
@@ -189,6 +286,101 @@ class ATVRagService:
         except Exception as exc:
             logger.warning(f"Scope gate failed open ({type(exc).__name__}): {exc}")
             return True
+
+    async def _responder_faq(
+        self,
+        faq: Candidata,
+        consulta_sanitizada: str,
+        intencion: str,
+        perfil_texto: str,
+        cultivo: Optional[str],
+        cfg: PromptConfig,
+        lat_sanitizacion: int,
+        lat_clasif: int,
+        lat_faq: int,
+    ) -> RAGResult:
+        """
+        Responde con la respuesta aprobada de la pregunta frecuente, adaptada por el LLM
+        al tono y al perfil, y cierra con un producto de AldeaZON tomado de las fichas más
+        parecidas (regla 6 del system_prompt). Si el LLM falla o mete una dosis que no está
+        ni en la respuesta aprobada ni en esas fichas, se entrega la respuesta aprobada tal
+        cual: ya la validó Asistencia Técnica.
+        """
+        f = faq.faq
+        fuente = f"Preguntas frecuentes de Asistencia Técnica, {f.codigo}"
+        registros = [{"tipo": "pregunta_frecuente", "codigo": f.codigo, "similitud": round(faq.similitud, 4)}]
+
+        t_ret = time.perf_counter()
+        try:
+            fichas = [h.payload or {} for h in await self._buscar_fichas(consulta_sanitizada, cultivo, cfg.retrieval_top_k)]
+        except Exception as exc:
+            # Sin fichas la FAQ responde igual; el LLM cierra invitando a la tienda (regla 6).
+            logger.warning(f"Product lookup for FAQ failed ({type(exc).__name__}): {exc}")
+            fichas = []
+        lat_faq += int((time.perf_counter() - t_ret) * 1000)
+        registros += fichas
+        productos = "\n".join(
+            cfg.chunk_template.format(**{campo: p.get(campo) for campo in CAMPOS_CHUNK}) for p in fichas
+        ) or "Sin fichas de productos para esta consulta."
+
+        user_prompt = cfg.faq_user_prompt_template.format(
+            codigo=f.codigo,
+            pregunta=f.pregunta,
+            respuesta=f.respuesta,
+            evitar=f.respuesta_evitar or "—",
+            productos=productos,
+            consulta=consulta_sanitizada,
+            perfil=perfil_texto,
+        )
+
+        t_llm = time.perf_counter()
+        respuesta_texto, modelo = None, f"{cfg.llm_modelo}_faq"
+        tokens_in = tokens_out = 0
+        # El producto lo elige una llamada aparte, en paralelo (producto_service.py).
+        generacion, ficha_producto = await asyncio.gather(
+            self._generar(user_prompt, cfg),
+            elegir_producto(self.llm_client, cfg, consulta_sanitizada, cultivo, fichas),
+            return_exceptions=True,
+        )
+        if isinstance(ficha_producto, BaseException):
+            ficha_producto = None
+        if isinstance(generacion, BaseException):
+            logger.warning(f"FAQ generation failed, serving approved answer ({type(generacion).__name__}): {generacion}")
+        else:
+            respuesta_texto, tokens_in, tokens_out = generacion
+
+        aprobada = f"{f.respuesta}\n\n[Fuente: {fuente}]"
+        if respuesta_texto is None:
+            respuesta_texto, modelo = aprobada, "faq_literal"
+        elif REGEX_ABSTENCION.search(respuesta_texto) or not validar_groundedness_dosis(
+            respuesta_texto, f"{f.respuesta} {f.respuesta_evitar or ''} {productos}"
+        ):
+            motivo = "abstención" if REGEX_ABSTENCION.search(respuesta_texto) else "dosis no respaldada"
+            logger.warning(f"FAQ generation rejected for {f.codigo} ({motivo}), serving approved answer")
+            respuesta_texto, modelo = aprobada, "faq_literal"
+
+        # La FAQ siempre cierra con producto: el de la ficha elegida o el mensaje de la tienda.
+        respuesta_texto = cerrar_con_producto(respuesta_texto, linea_producto(ficha_producto, cfg))
+        if ficha_producto:
+            registros.append({"tipo": "producto_recomendado", "producto": ficha_producto.get("producto"),
+                              "documento_fuente": ficha_producto.get("documento_fuente")})
+
+        return RAGResult(
+            consulta_sanitizada=consulta_sanitizada,
+            respuesta=respuesta_texto,
+            fuente=fuente,
+            confianza=min(max(faq.similitud, 0.0), 1.0),
+            intencion=intencion,
+            escalada_hitl=False,
+            modelo_utilizado=modelo,
+            registros_usados=registros,
+            tokens_entrada=tokens_in,
+            tokens_salida=tokens_out,
+            lat_sanitizacion_ms=lat_sanitizacion,
+            lat_clasif_ms=lat_clasif,
+            lat_retrieval_ms=lat_faq,
+            lat_llm_ms=int((time.perf_counter() - t_llm) * 1000),
+        )
 
     async def procesar_consulta(
         self,
@@ -212,11 +404,31 @@ class ATVRagService:
         # Phase 2: Intent Classification
         intencion, lat_clasif = clasificar_intencion(consulta_sanitizada)
 
-        # Phase 2.1: Scope gate. Separate call so the generation LLM never has to choose
+        # Phase 2.1: Preguntas frecuentes (atv.pregunta_frecuente) = punto de partida.
+        # Candidatas por embedding; el juez LLM corre en paralelo con el scope gate.
+        t_faq = time.perf_counter()
+        candidatas: List[Candidata] = []
+        if cfg.faq_candidatos > 0:
+            try:
+                await indice_faq.sincronizar(self.db, self.embedding_model)
+                candidatas = indice_faq.candidatas(self.embedding_model, consulta_sanitizada, cfg.faq_candidatos)
+            except Exception as exc:
+                # Sin preguntas frecuentes se sigue con las fichas: no tumba la consulta.
+                logger.error(f"FAQ index unavailable ({type(exc).__name__}): {exc}")
+                await self.db.rollback()
+        lat_faq = int((time.perf_counter() - t_faq) * 1000)
+
+        # Phase 2.2: Scope gate. Separate call so the generation LLM never has to choose
         # between "out of scope" and "not in the sheets" (gpt-4o-mini mixed them up and
         # refused agronomic questions whose retrieved context did not match).
         t_alcance = time.perf_counter()
-        if not await self._en_alcance(consulta_sanitizada, cfg):
+        en_alcance, faq = await asyncio.gather(
+            self._en_alcance(consulta_sanitizada, cfg),
+            elegir_faq(self.llm_client, cfg, consulta_sanitizada, cultivo_principal, candidatas),
+        )
+        lat_clasif += int((time.perf_counter() - t_alcance) * 1000)
+        # Una pregunta frecuente es del alcance por definición, aunque el gate dude.
+        if faq is None and not en_alcance:
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
                 respuesta=cfg.msg_fuera_alcance,
@@ -225,9 +437,14 @@ class ATVRagService:
                 escalada_hitl=False,
                 modelo_utilizado="scope_gate",
                 lat_sanitizacion_ms=lat_sanitizacion,
-                lat_clasif_ms=lat_clasif + int((time.perf_counter() - t_alcance) * 1000),
+                lat_clasif_ms=lat_clasif,
             )
-        lat_clasif += int((time.perf_counter() - t_alcance) * 1000)
+
+        if faq is not None:
+            return await self._responder_faq(
+                faq, consulta_sanitizada, intencion, perfil_texto, cultivo_principal, cfg,
+                lat_sanitizacion=lat_sanitizacion, lat_clasif=lat_clasif, lat_faq=lat_faq,
+            )
 
         # =================================================================
         # NEW: Phase 2.5: Redis Semantic Cache Interception
@@ -241,7 +458,8 @@ class ATVRagService:
         # anterior (si no, una respuesta vieja se sirve hasta 7 días después del cambio).
         huella_prompts = hashlib.sha256("\x1f".join(
             [cfg.system_prompt, cfg.user_prompt_template, cfg.chunk_template, cfg.llm_modelo,
-             str(cfg.llm_temperature), str(cfg.retrieval_top_k)]
+             str(cfg.llm_temperature), str(cfg.retrieval_top_k),
+             cfg.producto_selector_prompt, cfg.producto_linea_template, cfg.msg_producto_tienda]
         ).encode("utf-8")).hexdigest()[:12]
         clave_cache = f"{consulta_sanitizada}||{perfil_texto}||{huella_prompts}"
 
@@ -273,24 +491,7 @@ class ATVRagService:
         # Phase 3: Qdrant Asynchronous Retrieval
         t_ret = time.perf_counter()
         try:
-            texto_busqueda = (
-                f"{consulta_sanitizada} Cultivo: {cultivo_principal}." if cultivo_principal else consulta_sanitizada
-            )
-            embedded_result = list(self.embedding_model.embed([texto_busqueda]))
-            query_vector = embedded_result[0].tolist()
-
-            vector_name = await self._resolve_vector_name()
-            qdrant_query_vector = (
-                NamedVector(name=vector_name, vector=query_vector)
-                if vector_name is not None
-                else query_vector
-            )
-
-            search_result = await self.qdrant.search(
-                collection_name=self.alias_name,
-                query_vector=qdrant_query_vector,
-                limit=cfg.retrieval_top_k
-            )
+            search_result = await self._buscar_fichas(consulta_sanitizada, cultivo_principal, cfg.retrieval_top_k)
         except Exception as exc:
             lat_retrieval = int((time.perf_counter() - t_ret) * 1000)
             logger.error(f"Async Qdrant retrieval error: {str(exc)}\n{traceback.format_exc()}")
@@ -357,22 +558,19 @@ class ATVRagService:
             perfil=perfil_texto,
         )
 
-        # Phase 6: Asynchronous LLM Generation
+        # Phase 6: Asynchronous LLM Generation (+ product selector in parallel, producto_service.py)
         t_llm = time.perf_counter()
+        generacion, ficha_producto = await asyncio.gather(
+            self._generar(user_prompt, cfg),
+            elegir_producto(self.llm_client, cfg, consulta_sanitizada, cultivo_principal, metadata_list),
+            return_exceptions=True,
+        )
+        if isinstance(ficha_producto, BaseException):
+            ficha_producto = None
         try:
-            response = await self.llm_client.chat.completions.create(
-                model=cfg.llm_modelo,
-                messages=[
-                    {"role": "system", "content": cfg.system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=cfg.llm_temperature,
-                max_tokens=cfg.llm_max_tokens,
-                timeout=settings.llm_timeout_seconds
-            )
-            respuesta_texto = response.choices[0].message.content.strip()
-            tokens_in = response.usage.prompt_tokens if response.usage else 0
-            tokens_out = response.usage.completion_tokens if response.usage else 0
+            if isinstance(generacion, BaseException):
+                raise generacion
+            respuesta_texto, tokens_in, tokens_out = generacion
         except Exception as exc:
             lat_llm = int((time.perf_counter() - t_llm) * 1000)
             return RAGResult(
@@ -432,6 +630,9 @@ class ATVRagService:
                 error_tipo="GroundednessBreach",
                 componente_fallo="groundedness_gate"
             )
+
+        # Phase 7.5: cierre con producto de AldeaZON (no tras abstención ni rechazo: ya retornaron)
+        respuesta_texto = cerrar_con_producto(respuesta_texto, linea_producto(ficha_producto, cfg))
 
         # Phase 8: Commercial Sales Resolution (RSK-NEW-04)
         # If the technical query passed all gates and is a recommendation, resolve the cart payload.

@@ -8,12 +8,13 @@ from qdrant_client import AsyncQdrantClient
 
 # Core and Database
 from app.core.config import settings
-from app.db.session import get_db_session
+from app.db.session import AsyncSessionLocal, get_db_session
 from app.models.traceability import Consulta, ErrorLog
 
 # Services and Schemas
 from app.services.rag_service import ATVRagService
 from app.services.prompt_config import PromptConfigError, cargar_prompt_config
+from app.services.faq_service import indice_faq
 from app.services.perfilamiento import (
     ETAPA_PERFILAMIENTO, ETAPA_RESPUESTA, ExtractorPerfil, Perfilador, nueva_sesion_id,
 )
@@ -53,6 +54,17 @@ class ChatRequest(BaseModel):
 
 logger.info("Pre-loading bge-m3 dense embedding model into RAM (Singleton)...")
 embedding_model_singleton = TextEmbedding("intfloat/multilingual-e5-large")
+
+
+@app.on_event("startup")
+async def precargar_preguntas_frecuentes():
+    """Calcula los embeddings de atv.pregunta_frecuente al arrancar, no en la primera consulta."""
+    try:
+        async with AsyncSessionLocal() as session:
+            await indice_faq.sincronizar(session, embedding_model_singleton)
+    except Exception as exc:
+        # Se reintenta en cada consulta (rag_service); sin FAQ se responde con las fichas.
+        logger.warning(f"FAQ index not preloaded ({type(exc).__name__}): {exc}")
 
 @app.post("/api/v1/consultar", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
 async def procesar_consulta_interna(

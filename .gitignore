@@ -21,3 +21,4 @@ Thumbs.db
 fixtures/
 
 /vps1
+.venv-streamlit/

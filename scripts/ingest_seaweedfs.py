@@ -1,5 +1,6 @@
 # scripts/ingest_seaweedfs.py
 import os
+import re
 import gc
 import asyncio
 import logging
@@ -16,12 +17,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import CreateAliasOperation, CreateAlias
+from qdrant_client.models import CreateAliasOperation, CreateAlias, FieldCondition, Filter, FilterSelector, MatchValue
 from redis.asyncio import Redis
 
 from app.core.config import settings
 from app.models.traceability import InventarioArchivo, ErrorLog
 from app.services.extractor import extraer_desde_pdf
+from app.services.extractor_ficha import extraer_ficha
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("atv.ingestion")
@@ -35,6 +37,12 @@ CURRENT_CORPUS_VERSION = 1
 # that only happened to match f"{ALIAS_NAME}_v{CURRENT_CORPUS_VERSION}" by
 # coincidence. Deriving it directly removes that landmine.
 COLLECTION_NAME = f"{ALIAS_NAME}_v{CURRENT_CORPUS_VERSION}"
+
+# Desde v2 la extracción es por ficha (app/services/extractor_ficha.py). La
+# ingesta diaria mantiene la versión a la que apunta HOY el alias (ver
+# version_vigente): no vuelve a v1 cuando se promueve v2 con
+# scripts/reindexar_corpus.py, ni promueve v2 antes de validarla.
+VERSION_EXTRACCION_POR_FICHA = 2
 
 # Batch size for periodic Qdrant flush. We upsert per-file (see below) but
 # this caps how many text/metadata/id lists we keep resident at once if a
@@ -130,7 +138,35 @@ async def sincronizar_seaweedfs() -> None:
             logger.info("SeaweedFS sync & binary downloads complete.")
 
 
-def _ensure_qdrant_collection(qdrant: QdrantClient) -> None:
+def version_vigente(qdrant: QdrantClient) -> int:
+    """Versión de la colección a la que apunta el alias (atv_corpus -> atv_corpus_vN)."""
+    for alias in qdrant.get_aliases().aliases:
+        if alias.alias_name == ALIAS_NAME:
+            if m := re.fullmatch(rf"{re.escape(ALIAS_NAME)}_v(\d+)", alias.collection_name):
+                return int(m.group(1))
+    return CURRENT_CORPUS_VERSION
+
+
+def reemplazar_registros_documento(qdrant: QdrantClient, coleccion: str, filename: str, registros) -> None:
+    """Borra los puntos del documento en la colección y sube los nuevos (re-extraer no duplica)."""
+    qdrant.delete(
+        collection_name=coleccion,
+        points_selector=FilterSelector(filter=Filter(must=[
+            FieldCondition(key="documento_fuente", match=MatchValue(value=filename))
+        ])),
+    )
+    for i in range(0, len(registros), UPSERT_BATCH_SIZE):
+        lote = registros[i:i + UPSERT_BATCH_SIZE]
+        qdrant.add(
+            collection_name=coleccion,
+            documents=[r.texto_para_embedding() for r in lote],
+            metadata=[r.model_dump() for r in lote],
+            ids=[r.registro_id for r in lote],
+            batch_size=8,  # textos largos (fichas completas): lotes chicos = menos RAM de ONNX
+        )
+
+
+def _ensure_qdrant_collection(qdrant: QdrantClient, coleccion: str = COLLECTION_NAME) -> None:
     """
     Idempotent collection setup.
 
@@ -140,30 +176,35 @@ def _ensure_qdrant_collection(qdrant: QdrantClient) -> None:
     points already upserted survive a restart. The collection is only
     created fresh the first time it's missing.
     """
-    if not qdrant.collection_exists(COLLECTION_NAME):
-        logger.info(f"Collection '{COLLECTION_NAME}' does not exist yet. Creating it.")
+    if not qdrant.collection_exists(coleccion):
+        logger.info(f"Collection '{coleccion}' does not exist yet. Creating it.")
         qdrant.create_collection(
-            collection_name=COLLECTION_NAME,
+            collection_name=coleccion,
             vectors_config=qdrant.get_fastembed_vector_params(),
         )
     else:
-        logger.info(f"Collection '{COLLECTION_NAME}' already exists. Upserting incrementally.")
+        logger.info(f"Collection '{coleccion}' already exists. Upserting incrementally.")
 
 
-def reconstruir_indice_qdrant() -> None:
+def reconstruir_indice_qdrant() -> int:
+    """Indexa los PDF pendientes en la colección vigente y devuelve su versión (la que hay que promover)."""
     db = OfflineSyncSession()
 
     if not os.path.exists(STAGING_DIR):
         logger.error(f"Staging directory '{STAGING_DIR}' not found. Aborting index.")
         db.close()
-        return
+        return CURRENT_CORPUS_VERSION
 
     archivos_staging = [f for f in sorted(os.listdir(STAGING_DIR)) if f.lower().endswith(".pdf")]
     logger.info(f"Found {len(archivos_staging)} PDF(s) in staging for extraction.")
 
     qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     qdrant.set_model(EMBEDDING_MODEL)
-    _ensure_qdrant_collection(qdrant)
+    version = version_vigente(qdrant)
+    coleccion = f"{ALIAS_NAME}_v{version}"
+    por_ficha = version >= VERSION_EXTRACCION_POR_FICHA
+    logger.info(f"Corpus vigente: v{version} ('{coleccion}'), extracción {'por ficha' if por_ficha else 'por línea'}.")
+    _ensure_qdrant_collection(qdrant, coleccion)
 
     total_indexado = 0
     total_omitido = 0
@@ -200,7 +241,14 @@ def reconstruir_indice_qdrant() -> None:
             extracted_count = 0
             logger.info(f"Extracting atomic records from: {filename}...")
 
-            for registro in extraer_desde_pdf(filepath, filename):
+            if por_ficha:
+                resultado = extraer_ficha(filepath, filename, version)
+                if resultado.error:
+                    raise RuntimeError(resultado.error)
+                reemplazar_registros_documento(qdrant, coleccion, filename, resultado.registros)
+                extracted_count = len(resultado.registros)
+
+            for registro in ([] if por_ficha else extraer_desde_pdf(filepath, filename)):
                 lote_textos.append(registro.texto_para_embedding())
                 lote_metadata.append(registro.model_dump())
                 lote_ids.append(registro.registro_id)
@@ -269,12 +317,13 @@ def reconstruir_indice_qdrant() -> None:
 
     if total_indexado == 0 and total_omitido == 0:
         logger.error("[CRITICAL] Extraction finished with 0 chunks indexed and 0 skipped. Qdrant index may be empty.")
-        return
+        return version
 
     logger.info(
         f"Indexing pass complete. {total_indexado} file(s) newly indexed, "
         f"{total_omitido} file(s) already up to date and skipped."
     )
+    return version
 
 
 async def promover_indice_y_purgar_cache(version_nueva: int) -> None:

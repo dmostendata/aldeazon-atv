@@ -167,3 +167,32 @@ class SesionPerfil(Base):
         TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc), nullable=False
     )
+
+
+class PreguntaFrecuente(Base):
+    """
+    Preguntas frecuentes aprobadas por Asistencia Técnica (scripts/005_create_pregunta_frecuente.sql).
+    Punto de partida de cada consulta: si la pregunta coincide, se responde con esto y no con las fichas.
+    La carga scripts/cargar_preguntas_frecuentes.py desde el Excel de docs/.
+    """
+    __tablename__ = "pregunta_frecuente"
+    __table_args__ = {"schema": "atv"}
+
+    codigo: Mapped[str] = mapped_column(String(16), primary_key=True)
+    cultivo: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    categoria: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pregunta: Mapped[str] = mapped_column(Text, nullable=False)
+    variantes: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list, nullable=False)
+    respuesta: Mapped[str] = mapped_column(Text, nullable=False)
+    respuesta_evitar: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dato_critico: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    nivel_riesgo: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    productos: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fuente: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    archivo_origen: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ts_actualizado: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    actualizado_por: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

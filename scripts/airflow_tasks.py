@@ -68,9 +68,11 @@ async def task_validar_hitl():
 
 async def task_construir_y_promover():
     logger.info("Reconstruyendo índice en Qdrant...")
-    await asyncio.to_thread(reconstruir_indice_qdrant)
-    logger.info(f"Promoviendo alias a versión {CURRENT_CORPUS_VERSION} y purgando caché...")
-    await promover_indice_y_purgar_cache(version_nueva=CURRENT_CORPUS_VERSION)
+    # La versión es la que ya apunta el alias (ingest_seaweedfs.version_vigente):
+    # la ingesta diaria nunca cambia de versión; eso lo hace scripts/reindexar_corpus.py.
+    version = await asyncio.to_thread(reconstruir_indice_qdrant)
+    logger.info(f"Promoviendo alias a versión {version} y purgando caché...")
+    await promover_indice_y_purgar_cache(version_nueva=version)
     logger.info("Despliegue y promoción completados con éxito.")
 
 

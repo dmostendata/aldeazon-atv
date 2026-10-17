@@ -142,8 +142,8 @@ def _cascada_determinista(filepath: str, filename: str) -> Iterator[RegistroAtom
             idioma="es"
         )
 
-def _via_vision(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
-    client = OpenAI(api_key=settings.openai_api_key)
+def transcribir_con_vision(filepath: str, filename: str, client: OpenAI) -> str:
+    """Transcribe cada página (renderizada a 200 dpi) a Markdown con el modelo de visión."""
     markdown_pages = []
 
     with pdfium.PdfDocument(filepath) as pdf:
@@ -171,7 +171,12 @@ def _via_vision(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
             except Exception as exc:
                 logger.error(f"[{filename}] Vision API Error on page {i}: {exc}")
 
-    combined_markdown = "\n".join(markdown_pages)
+    return "\n".join(markdown_pages)
+
+
+def _via_vision(filepath: str, filename: str) -> Iterator[RegistroAtomico]:
+    client = OpenAI(api_key=settings.openai_api_key)
+    combined_markdown = transcribir_con_vision(filepath, filename, client)
 
     coincidencias = []
     for line in combined_markdown.splitlines():

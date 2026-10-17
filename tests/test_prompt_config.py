@@ -35,6 +35,12 @@ FILAS_VALIDAS = {
     "perfil_max_preguntas": "4",
     "alcance_prompt": "Responde JSON en_alcance.",
     "msg_fuera_alcance": "Solo temas de Aldea.",
+    "faq_juez_prompt": "Responde JSON codigo.",
+    "faq_user_prompt_template": "{codigo}: {pregunta}\n{respuesta}\nEvitar: {evitar}\n{productos}\n{consulta}\n{perfil}",
+    "faq_candidatos": "5",
+    "producto_selector_prompt": "Responde JSON indice.",
+    "producto_linea_template": "Producto AldeaZON recomendado: {producto} ({uso}).{dosis}",
+    "msg_producto_tienda": "Producto AldeaZON recomendado: en su tienda le ayudamos.",
 }
 
 
