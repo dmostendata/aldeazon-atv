@@ -2,6 +2,7 @@
 import os
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -45,6 +46,31 @@ class Settings(BaseSettings):
     confidence_threshold_informational: float = 0.55
     confidence_threshold_abstention: float = 0.35
 
+    # --- Perfil del usuario (Semillero) ---
+    # Salt del hash_determinista de Semillero (HMAC-SHA256). Sin él, la API no
+    # puede reconocer a socios/clientes por cédula y perfila solo con preguntas.
+    semillero_hash_salt: Optional[str] = None
+    # Base `semillero` (stg_cafe, PostgreSQL de Semillero), solo lectura: la usa
+    # scripts/construir_perfiles.py. Sin usuario o contraseña, la URL queda en None.
+    semillero_pg_host: str = "10.0.0.14"
+    semillero_pg_port: int = 5432
+    semillero_pg_db: str = "semillero"
+    semillero_pg_user: Optional[str] = None
+    semillero_pg_password: Optional[str] = None
+
+    @property
+    def semillero_database_url(self) -> Optional[str]:
+        if not (self.semillero_pg_user and self.semillero_pg_password):
+            return None
+        return URL.create(
+            "postgresql+psycopg",
+            username=self.semillero_pg_user,
+            password=self.semillero_pg_password,  # URL.create escapa @, :, / y demás
+            host=self.semillero_pg_host,
+            port=self.semillero_pg_port,
+            database=self.semillero_pg_db,
+        ).render_as_string(hide_password=False)
+
     # --- Hugging Face Runtime Optimization ---
     hf_token: Optional[str] = None
 
@@ -61,3 +87,5 @@ settings = Settings()
 if settings.hf_token:
     os.environ["HF_TOKEN"] = settings.hf_token
     os.environ["HUGGING_FACE_HUB_TOKEN"] = settings.hf_token
+
+os.environ.setdefault("FASTEMBED_CACHE_PATH", "/var/www/aldeazon-atv/.cache/fastembed")

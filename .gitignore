@@ -19,3 +19,5 @@ postgres_data/
 .DS_Store
 Thumbs.db
 fixtures/
+
+/vps1

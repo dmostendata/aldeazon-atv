@@ -13,7 +13,12 @@ from app.models.traceability import Consulta, ErrorLog
 
 # Services and Schemas
 from app.services.rag_service import ATVRagService
+from app.services.prompt_config import PromptConfigError, cargar_prompt_config
+from app.services.perfilamiento import (
+    ETAPA_PERFILAMIENTO, ETAPA_RESPUESTA, ExtractorPerfil, Perfilador, nueva_sesion_id,
+)
 from app.schemas.domain import ChatResponse
+from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel, Field
 
 from fastembed import TextEmbedding
@@ -37,11 +42,14 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
 
 
 class ChatRequest(BaseModel):
-    """Incoming JSON payload from App AldeaZON."""
-    vendedor_id: str = Field(..., description="Hash/ID del vendedor en tienda")
-    sucursal_id: int = Field(..., description="ID de la sucursal de AldeaZON (stc2.sucursal)")
+    """Incoming JSON payload from the AldeaZON web / App AldeaZON."""
+    vendedor_id: str = Field("web", description="Hash/ID del vendedor en tienda, o 'web' para usuarios de la web")
+    sucursal_id: int | None = Field(None, description="ID de la sucursal de AldeaZON (stc2.sucursal), si se conoce")
     consulta: str = Field(..., min_length=2, max_length=1000)
-    sesion_id: str | None = Field(None, description="Idempotencia/sesión")
+    sesion_id: str | None = Field(
+        None, max_length=64,
+        description="Sesión de la conversación. Vacío = sesión nueva; la respuesta trae el id a reenviar.",
+    )
 
 logger.info("Pre-loading bge-m3 dense embedding model into RAM (Singleton)...")
 embedding_model_singleton = TextEmbedding("intfloat/multilingual-e5-large")
@@ -56,14 +64,47 @@ async def procesar_consulta_interna(
     Strictly enforced to complete within the 10,000ms SLA.
     """
     start_time = time.perf_counter()
-    
+    sesion_id = request.sesion_id or nueva_sesion_id()
+
     # 1. Inject connections into the RAG Orchestrator
     rag_service = ATVRagService(
         qdrant_client=qdrant_client, 
         embedding_model=embedding_model_singleton,
         db_session=db
     )
-    result = await rag_service.procesar_consulta(request.consulta, request.sucursal_id)
+    try:
+        # atv.prompt_config is the single source of truth: no hardcoded fallback.
+        cfg = await cargar_prompt_config(db)
+
+        # 2. Perfilamiento: antes de recomendar, el ATV pregunta quién es y cómo es su finca.
+        perfilador = Perfilador(db, ExtractorPerfil(rag_service.llm_client), settings.semillero_hash_salt)
+        turno = await perfilador.procesar_turno(sesion_id, request.consulta, cfg)
+        if turno.etapa == ETAPA_PERFILAMIENTO:
+            await db.commit()
+            return ChatResponse(
+                respuesta=turno.respuesta,
+                escalada_hitl=False,
+                latencia_ms=int((time.perf_counter() - start_time) * 1000),
+                carrito=[],
+                sesion_id=sesion_id,
+                etapa=ETAPA_PERFILAMIENTO,
+                perfil=turno.perfil.resumen_publico(),
+            )
+
+        # El estado de la sesión se guarda antes del RAG: un fallo del catálogo
+        # dentro de la misma transacción no debe hacer perder el perfil.
+        await db.commit()
+        result = await rag_service.procesar_consulta(
+            turno.consulta_para_rag, request.sucursal_id, perfil=turno.perfil, cfg=cfg
+        )
+    except PromptConfigError as exc:
+        logger.error(f"Prompt config unavailable: {exc}")
+        await _registrar_error(db, "prompt_config", exc)
+        raise HTTPException(status_code=503, detail="Configuración de prompts no disponible")
+    except SQLAlchemyError as exc:
+        logger.error(f"Perfilamiento unavailable: {exc}")
+        await _registrar_error(db, "perfilamiento", exc)
+        raise HTTPException(status_code=503, detail="Perfilamiento no disponible")
     
     lat_total = int((time.perf_counter() - start_time) * 1000)
     
@@ -113,9 +154,28 @@ async def procesar_consulta_interna(
     await db.commit()
     
     return ChatResponse(
-        respuesta=result.respuesta,
+        respuesta=f"{turno.aviso}\n\n{result.respuesta}" if turno.aviso else result.respuesta,
         fuente=result.fuente,
         escalada_hitl=result.escalada_hitl,
         latencia_ms=lat_total,
-        carrito=result.carrito
+        carrito=result.carrito,
+        sesion_id=sesion_id,
+        etapa=ETAPA_RESPUESTA,
+        perfil=turno.perfil.resumen_publico(),
     )
+
+
+async def _registrar_error(db: AsyncSession, componente: str, exc: Exception) -> None:
+    """Persiste el error en atv.error_log sin tapar la excepción original."""
+    try:
+        await db.rollback()
+        db.add(ErrorLog(
+            componente=componente,
+            excepcion_tipo=type(exc).__name__,
+            mensaje=str(exc)[:2000],
+            stack_trace=None,
+            resuelto=False
+        ))
+        await db.commit()
+    except Exception as log_exc:
+        logger.error(f"Could not persist {componente} error to atv.error_log: {log_exc}")

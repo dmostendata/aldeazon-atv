@@ -1,0 +1,15 @@
+{
+  "database": "staging",
+  "database_password": "5ZQo58T4O3fXGAIgWN#6q8Vl",
+  "database_username": "ostendata",
+  "descripcion": "Acceso PostgreSQL staging mediante túnel SSH integrado de Navicat",
+  "metodo_acceso": "tunel-ssh-integrado-navicat, misma llave Publica DEVELOP",
+  "navicat_ssh_tunnel": "activado",
+  "postgresql_host": "10.0.0.14",
+  "postgresql_port": "5432",
+  "ssh_authentication": "clave-publica",
+  "ssh_host": "analytics-db.aldeaglobal.com",
+  "ssh_port": "5665",
+  "ssh_private_key": "Usar la misma llave privada que Ostendata ya utiliza para Develop",
+  "ssh_username": "aldea_analytics"
+}

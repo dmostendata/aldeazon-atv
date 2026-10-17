@@ -1,6 +1,8 @@
 # app/services/rag_service.py
 import re
+import json
 import time
+import hashlib
 import logging
 import traceback
 import httpx
@@ -15,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.services.pii_sanitizer import sanitizar_pii, clasificar_intencion
 from app.services.catalog import resolver_productos_comerciales, construir_carrito_items
+from app.services.prompt_config import cargar_prompt_config, CAMPOS_CHUNK, PromptConfig
+from app.services.perfil_cliente import PerfilUsuario
 from app.schemas.domain import CarritoItem
 
 from app.services.cache_service import semantic_cache
@@ -28,8 +32,12 @@ REGEX_DOSIS_VALIDACION = re.compile(
     re.IGNORECASE
 )
 
+# Only the mandated abstention phrase ('No tengo esa información en las fichas vigentes...').
+# "Asistencia Técnica" is NOT a signal: the system prompt requires it in every
+# recommendation ("Valide esta recomendación con Asistencia Técnica..."), which
+# escalated every recommendation to HITL and always emptied the cart.
 REGEX_ABSTENCION = re.compile(
-    r'(No\s+tengo\s+(esa\s+)?informaci[oó]n|fichas\s+vigentes|Asistencia\s+T[eé]cnica)',
+    r'(No\s+tengo\s+(esa\s+)?informaci[oó]n|fichas\s+vigentes)',
     re.IGNORECASE
 )
 
@@ -38,14 +46,8 @@ UMBRAL_CONFIANZA: Dict[str, float] = {
     "recomendacion": settings.confidence_threshold_recommendation,
 }
 
-SYSTEM_ATV = """
-Eres el Asistente Técnico Virtual de AldeaZON. Ayudas a vendedores de tiendas de insumos agrícolas en Nicaragua. Reglas obligatorias:
-1. Responde SOLO con la información del CONTEXTO. Si el contexto no contiene la respuesta, di exactamente: 'No tengo esa información en las fichas vigentes. Consulta al Área de Asistencia Técnica.'
-2. Nunca inventes dosis, productos ni condiciones. Toda cifra que menciones debe estar literalmente en el contexto.
-3. Cierra SIEMPRE con la fuente: [Fuente: {documento}, versión {v}].
-4. Responde en español, claro y breve. Máximo ~120 palabras.
-5. Si la consulta pide una recomendación de producto o dosis, incluye: 'Valida esta recomendación con Asistencia Técnica antes de aplicarla.'
-""".strip()
+# System prompt, plantillas, mensajes de fallback y parámetros LLM viven en
+# atv.prompt_config (ver app/services/prompt_config.py). Se leen en cada consulta.
 
 
 class RAGResult(BaseModel):
@@ -56,7 +58,7 @@ class RAGResult(BaseModel):
     confianza: float
     intencion: str
     escalada_hitl: bool = False
-    modelo_utilizado: str = "gpt-4o-mini"
+    modelo_utilizado: str = ""
     registros_usados: List[Dict[str, Any]] = Field(default_factory=list)
     carrito: List[CarritoItem] = Field(default_factory=list)
     
@@ -169,12 +171,63 @@ class ATVRagService:
         self._vector_name_resolved = True
         return self._vector_name
 
-    async def procesar_consulta(self, consulta_raw: str, sucursal_id: int) -> RAGResult:
+    async def _en_alcance(self, consulta_sanitizada: str, cfg: PromptConfig) -> bool:
+        """True if the query is about agriculture or Aldea Global. Fails open (True) on any error."""
+        try:
+            response = await self.llm_client.chat.completions.create(
+                model=cfg.llm_modelo,
+                messages=[
+                    {"role": "system", "content": cfg.alcance_prompt},
+                    {"role": "user", "content": consulta_sanitizada},
+                ],
+                temperature=0,
+                max_tokens=20,
+                response_format={"type": "json_object"},
+                timeout=settings.llm_timeout_seconds,
+            )
+            return json.loads(response.choices[0].message.content).get("en_alcance") is not False
+        except Exception as exc:
+            logger.warning(f"Scope gate failed open ({type(exc).__name__}): {exc}")
+            return True
+
+    async def procesar_consulta(
+        self,
+        consulta_raw: str,
+        sucursal_id: Optional[int],
+        perfil: Optional[PerfilUsuario] = None,
+        cfg: Optional[PromptConfig] = None,
+    ) -> RAGResult:
+        # Phase 0: Prompt configuration from PostgreSQL (single source of truth).
+        # PromptConfigError is intentionally NOT caught here: the endpoint maps it to HTTP 503.
+        if cfg is None:
+            cfg = await cargar_prompt_config(self.db)
+
+        # Perfil del usuario (perfilamiento.py): entra al prompt, a la búsqueda y a la caché.
+        perfil_texto = perfil.resumen_para_prompt() if perfil else "Sin perfil del usuario."
+        cultivo_principal = perfil.cultivo_principal() if perfil else None
+
         # Phase 1: PII Sanitization (Ley 787 Compliance)
         consulta_sanitizada, lat_sanitizacion = sanitizar_pii(consulta_raw)
         
         # Phase 2: Intent Classification
         intencion, lat_clasif = clasificar_intencion(consulta_sanitizada)
+
+        # Phase 2.1: Scope gate. Separate call so the generation LLM never has to choose
+        # between "out of scope" and "not in the sheets" (gpt-4o-mini mixed them up and
+        # refused agronomic questions whose retrieved context did not match).
+        t_alcance = time.perf_counter()
+        if not await self._en_alcance(consulta_sanitizada, cfg):
+            return RAGResult(
+                consulta_sanitizada=consulta_sanitizada,
+                respuesta=cfg.msg_fuera_alcance,
+                confianza=0.0,
+                intencion="fuera_alcance",
+                escalada_hitl=False,
+                modelo_utilizado="scope_gate",
+                lat_sanitizacion_ms=lat_sanitizacion,
+                lat_clasif_ms=lat_clasif + int((time.perf_counter() - t_alcance) * 1000),
+            )
+        lat_clasif += int((time.perf_counter() - t_alcance) * 1000)
 
         # =================================================================
         # NEW: Phase 2.5: Redis Semantic Cache Interception
@@ -183,9 +236,18 @@ class ATVRagService:
         # locking in outdated chemical recommendations (RSK-001).
         version_corpus_actual = 1 # In production, query this from `atv.inventario_archivo`
         
+        # La respuesta depende del perfil y de los prompts: dos perfiles distintos no
+        # comparten caché, y editar atv.prompt_config invalida lo cacheado con la versión
+        # anterior (si no, una respuesta vieja se sirve hasta 7 días después del cambio).
+        huella_prompts = hashlib.sha256("\x1f".join(
+            [cfg.system_prompt, cfg.user_prompt_template, cfg.chunk_template, cfg.llm_modelo,
+             str(cfg.llm_temperature), str(cfg.retrieval_top_k)]
+        ).encode("utf-8")).hexdigest()[:12]
+        clave_cache = f"{consulta_sanitizada}||{perfil_texto}||{huella_prompts}"
+
         if intencion == "informativa":
             t_cache = time.perf_counter()
-            cached_data = await semantic_cache.get_cached_response(consulta_sanitizada, version_corpus_actual)
+            cached_data = await semantic_cache.get_cached_response(clave_cache, version_corpus_actual)
             
             if cached_data:
                 lat_cache = int((time.perf_counter() - t_cache) * 1000)
@@ -211,7 +273,10 @@ class ATVRagService:
         # Phase 3: Qdrant Asynchronous Retrieval
         t_ret = time.perf_counter()
         try:
-            embedded_result = list(self.embedding_model.embed([consulta_sanitizada]))
+            texto_busqueda = (
+                f"{consulta_sanitizada} Cultivo: {cultivo_principal}." if cultivo_principal else consulta_sanitizada
+            )
+            embedded_result = list(self.embedding_model.embed([texto_busqueda]))
             query_vector = embedded_result[0].tolist()
 
             vector_name = await self._resolve_vector_name()
@@ -224,14 +289,14 @@ class ATVRagService:
             search_result = await self.qdrant.search(
                 collection_name=self.alias_name,
                 query_vector=qdrant_query_vector,
-                limit=3
+                limit=cfg.retrieval_top_k
             )
         except Exception as exc:
             lat_retrieval = int((time.perf_counter() - t_ret) * 1000)
             logger.error(f"Async Qdrant retrieval error: {str(exc)}\n{traceback.format_exc()}")
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
-                respuesta="El servicio de consulta técnica está temporalmente indisponible. Consulta con Asistencia Técnica.",
+                respuesta=cfg.msg_retrieval_error,
                 confianza=0.0,
                 intencion=intencion,
                 escalada_hitl=True,
@@ -254,7 +319,7 @@ class ATVRagService:
         if max_score < umbral_requerido or not hits:
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
-                respuesta="No tengo suficiente información respaldada en el corpus para esta recomendación. Valida directamente con el Área de Asistencia Técnica.",
+                respuesta=cfg.msg_baja_confianza,
                 confianza=max_score,
                 intencion=intencion,
                 escalada_hitl=True,
@@ -278,30 +343,31 @@ class ATVRagService:
                 ver_top1 = payload.get("version_corpus", 1)
                 principio_activo_top1 = payload.get("principio_activo")
             
-            chunk_str = (
-                f"[Documento: {payload.get('documento_fuente')} | "
-                f"Producto: {payload.get('producto')} | "
-                f"Cultivo: {payload.get('cultivo')} | Dosis: {payload.get('dosis')} | "
-                f"Condiciones: {payload.get('condiciones')}]"
+            chunk_str = cfg.chunk_template.format(
+                **{campo: payload.get(campo) for campo in CAMPOS_CHUNK}
             )
             contexto_chunks.append(chunk_str)
             metadata_list.append(payload)
 
         fuente_formateada = f"{doc_top1}, versión {ver_top1}"
         contexto_completo = "\n".join(contexto_chunks)
-        user_prompt = f"CONTEXTO RECUPERADO:\n{contexto_completo}\n\nCONSULTA DEL VENDEDOR:\n{consulta_sanitizada}"
+        user_prompt = cfg.user_prompt_template.format(
+            contexto=contexto_completo,
+            consulta=consulta_sanitizada,
+            perfil=perfil_texto,
+        )
 
         # Phase 6: Asynchronous LLM Generation
         t_llm = time.perf_counter()
         try:
             response = await self.llm_client.chat.completions.create(
-                model=settings.llm_primary_model,
+                model=cfg.llm_modelo,
                 messages=[
-                    {"role": "system", "content": SYSTEM_ATV},
+                    {"role": "system", "content": cfg.system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.2,
-                max_tokens=250,
+                temperature=cfg.llm_temperature,
+                max_tokens=cfg.llm_max_tokens,
                 timeout=settings.llm_timeout_seconds
             )
             respuesta_texto = response.choices[0].message.content.strip()
@@ -311,7 +377,7 @@ class ATVRagService:
             lat_llm = int((time.perf_counter() - t_llm) * 1000)
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
-                respuesta="Error temporal de conexión con el generador técnico. Valida la dosis con Asistencia Técnica.",
+                respuesta=cfg.msg_llm_error,
                 fuente=fuente_formateada,
                 confianza=max_score,
                 intencion=intencion,
@@ -337,7 +403,7 @@ class ATVRagService:
                 confianza=max_score,
                 intencion=intencion,
                 escalada_hitl=True,  # Abstention triggers HITL workflow
-                modelo_utilizado=f"{settings.llm_primary_model}_abstencion",
+                modelo_utilizado=f"{cfg.llm_modelo}_abstencion",
                 registros_usados=metadata_list,
                 tokens_entrada=tokens_in,
                 tokens_salida=tokens_out,
@@ -350,12 +416,12 @@ class ATVRagService:
         if not validar_groundedness_dosis(respuesta_texto, contexto_completo):
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
-                respuesta="La dosis generada requiere verificación técnica. Consulta con el Área de Asistencia Técnica antes de aplicarla.",
+                respuesta=cfg.msg_groundedness_rechazo,
                 fuente=fuente_formateada,
                 confianza=max_score,
                 intencion=intencion,
                 escalada_hitl=True,
-                modelo_utilizado=f"{settings.llm_primary_model}_rejected",
+                modelo_utilizado=f"{cfg.llm_modelo}_rejected",
                 registros_usados=metadata_list,
                 tokens_entrada=tokens_in,
                 tokens_salida=tokens_out,
@@ -370,20 +436,26 @@ class ATVRagService:
         # Phase 8: Commercial Sales Resolution (RSK-NEW-04)
         # If the technical query passed all gates and is a recommendation, resolve the cart payload.
         carrito = []
-        if intencion == "recomendacion" and principio_activo_top1:
+        sucursal_carrito = sucursal_id or (perfil.sucursal_id if perfil else None)
+        if intencion == "recomendacion" and principio_activo_top1 and sucursal_carrito:
             productos_comerciales = await resolver_productos_comerciales(
                 session=self.db,
                 principio_activo=principio_activo_top1,
-                sucursal_id=sucursal_id
+                sucursal_id=sucursal_carrito
             )
-            carrito = construir_carrito_items(productos_comerciales)
+            # Precio de asociado solo para socios activos identificados; sin perfil
+            # (llamada directa de la tienda) se mantiene el comportamiento anterior.
+            carrito = construir_carrito_items(
+                productos_comerciales,
+                aplicar_precio_asociado=perfil.es_asociado_activo if perfil else True,
+            )
 
         # =================================================================
         # NEW: Phase 9: Cache the Final Result
         # =================================================================
         if intencion == "informativa":
             await semantic_cache.set_cached_response(
-                consulta_sanitizada=consulta_sanitizada,
+                consulta_sanitizada=clave_cache,
                 version_corpus=version_corpus_actual,
                 response_payload={
                     "respuesta": respuesta_texto,
@@ -400,7 +472,7 @@ class ATVRagService:
             confianza=max_score,
             intencion=intencion,
             escalada_hitl=False,
-            modelo_utilizado=settings.llm_primary_model,
+            modelo_utilizado=cfg.llm_modelo,
             registros_usados=metadata_list,
             carrito=carrito,
             tokens_entrada=tokens_in,

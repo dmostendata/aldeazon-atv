@@ -187,12 +187,13 @@ def copiar_dag_a_vps2(dags_dir: str, local_file: Path = LOCAL_DAG_FILE, key_path
 
 
 
-def asegurar_dag_en_airflow(force_update: bool = False, key_path: str = AIRFLOW_SSH_KEY) -> bool:
+def asegurar_dag_en_airflow(force_update: bool = False, key_path: str = AIRFLOW_SSH_KEY,
+                            local_file: Path = LOCAL_DAG_FILE) -> bool:
     """
     Función principal:
     1. Comprueba conexión SSH con VPS2.
     2. Resuelve la ruta de DAGs en VPS2.
-    3. Verifica si dag_ingesta.py ya existe.
+    3. Verifica si el DAG (dag_ingesta.py por defecto) ya existe.
     4. Si no existe (o si force_update=True), lo copia.
     """
     logger.info(f"Comprobando acceso SSH a Airflow en {AIRFLOW_USER}@{AIRFLOW_HOST}:{AIRFLOW_PORT}...")
@@ -216,8 +217,8 @@ def asegurar_dag_en_airflow(force_update: bool = False, key_path: str = AIRFLOW_
         logger.error("Define la variable AIRFLOW_DAGS_DIR en .env con la ruta absoluta en VPS2 (ej: /opt/airflow/dags).")
         return False
 
-    # Verificar si dag_ingesta.py ya existe
-    dag_name = LOCAL_DAG_FILE.name
+    # Verificar si el DAG ya existe
+    dag_name = local_file.name
     existe = verificar_dag_en_airflow(dags_dir, dag_name, key_path)
 
     if existe and not force_update:
@@ -231,21 +232,23 @@ def asegurar_dag_en_airflow(force_update: bool = False, key_path: str = AIRFLOW_
         logger.warning(f"El DAG '{dag_name}' NO existe en Airflow ({dags_dir}). Procediendo a copiar...")
 
     # Copiar archivo
-    return copiar_dag_a_vps2(dags_dir, LOCAL_DAG_FILE, key_path)
+    return copiar_dag_a_vps2(dags_dir, local_file, key_path)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Verifica y sincroniza dag_ingesta.py hacia el servidor de Airflow (VPS2).")
+    parser = argparse.ArgumentParser(description="Verifica y sincroniza un DAG (por defecto dag_ingesta.py) hacia el servidor de Airflow (VPS2).")
     parser.add_argument("--force", "-f", action="store_true", help="Fuerza la copia del DAG incluso si ya existe en VPS2.")
     parser.add_argument("--key", "-k", type=str, default=AIRFLOW_SSH_KEY, help="Ruta a la llave privada SSH para conectar a VPS2.")
     parser.add_argument("--dags-dir", "-d", type=str, default="", help="Ruta de DAGs en VPS2 (omite autodetección).")
+    parser.add_argument("--archivo", "-a", type=str, default=str(LOCAL_DAG_FILE), help="DAG local a sincronizar (ej: dags/dag_perfil_productor.py).")
 
     args = parser.parse_args()
 
     if args.dags_dir:
         AIRFLOW_DAGS_DIR = args.dags_dir
 
-    exito = asegurar_dag_en_airflow(force_update=args.force, key_path=args.key)
+    exito = asegurar_dag_en_airflow(force_update=args.force, key_path=args.key,
+                                    local_file=Path(args.archivo).resolve())
     sys.exit(0 if exito else 1)

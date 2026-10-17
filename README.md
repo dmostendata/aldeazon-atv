@@ -59,7 +59,9 @@ The **AldeaZON Technical Sales Assistant (ATV)** is an event-driven, hybrid Retr
         
     2.  **Confidence & HITL Routing:** Queries falling below similarity confidence thresholds (**0.70** for recommendations, **0.55** for informational queries) bypass LLM generation and route to Human-In-The-Loop (**HITL**) technical assistance.
         
-    3.  **Default Abstention:** Queries without matching corpus context emit a mandatory fallback: _"No tengo esa información en las fichas vigentes. Consulta al Área de Asistencia Técnica."_
+    3.  **Default Abstention:** Queries without matching corpus context emit a mandatory fallback: _"No tengo esa información en las fichas vigentes. Consulte al Área de Asistencia Técnica."_ Only this phrase escalates; the mandatory closing line of every recommendation (_"Valide esta recomendación con Asistencia Técnica antes de aplicarla."_) does not.
+
+    4.  **Scope Gate:** A separate classification call (`alcance_prompt`) answers only agricultural and Aldea Global topics; anything else gets `msg_fuera_alcance` without reaching retrieval (see §11.5).
         
 *   **Ley 787 Compliance (Nicaraguan Data Privacy):**
     
@@ -87,25 +89,45 @@ The serving layer exposes a synchronous HTTP POST endpoint accessible exclusivel
 *   **SLA Target:** $\\le 10,000\\text{ ms}$ total execution budget ($p95$). Latency budget breaches generate persistent warnings in `atv.error_log`.
     
 
+The agent first profiles the user over several turns (see §11): the web client sends `sesion_id` empty on the first message and then echoes back the `sesion_id` it receives.
+
 ### Request Payload (`ChatRequest`)
 
 JSON
 
     {
-      "vendedor_id": "usr_987654",
-      "consulta": "¿Cuál es la dosis de Consento 45 SC para tomate?",
-      "sesion_id": "sess_112233"
+      "consulta": "¿Qué producto me recomienda para la roya del café?",
+      "sesion_id": "3f9c2a7e5b1d4c0e8a6f2b9d7e1c4a50",
+      "sucursal_id": null,
+      "vendedor_id": "web"
     }
 
 ### Response Payload (`ChatResponse` — HTTP 200 OK)
 
-JSON
+Profiling turn:
 
     {
-      "respuesta": "Aplica 1,42 - 2,14 l/ha. Valida esta recomendación con Asistencia Técnica antes de aplicarla. [Fuente: Ficha_Consento.pdf, versión 1]",
-      "fuente": "Ficha_Consento.pdf, versión 1",
+      "respuesta": "¿En qué municipio o departamento está su finca (o su negocio)?",
+      "etapa": "perfilamiento",
+      "sesion_id": "3f9c2a7e5b1d4c0e8a6f2b9d7e1c4a50",
+      "perfil": {"tipo_usuario": "productor", "cultivos": [{"nombre": "café", "area_mz": 2.0}], "...": "..."},
+      "fuente": null,
       "escalada_hitl": false,
-      "latencia_ms": 3420
+      "carrito": [],
+      "latencia_ms": 1640
+    }
+
+Answer turn:
+
+    {
+      "respuesta": "Para el control de la roya del café, le recomiendo considerar MISTRAL EXTRA 32 SC, con una dosis de 0.4 a 0.6 L/ha... Valide esta recomendación con Asistencia Técnica antes de aplicarla. [Fuente: FICHA TÉCNICA MISTRAL EXTRA 32 SC.pdf, versión 1]",
+      "etapa": "respuesta",
+      "sesion_id": "3f9c2a7e5b1d4c0e8a6f2b9d7e1c4a50",
+      "perfil": {"...": "..."},
+      "fuente": "FICHA TÉCNICA MISTRAL EXTRA 32 SC.pdf, versión 1",
+      "escalada_hitl": false,
+      "carrito": [],
+      "latencia_ms": 2566
     }
 
 ## 4\. Local Development Setup (macOS Environment)
@@ -238,17 +260,31 @@ Plaintext
     │   ├── services/
     │   │   ├── extractor.py          # PDF Extraction Router (pdfplumber -> pypdfium2 -> Vision)
     │   │   ├── logger_service.py     # Non-blocking async APM & SLA audit logging
-    │   │   └── rag_service.py        # Hybrid RAG, PII Sanitizer, Groundedness Gate & HITL routing
+    │   │   ├── perfil_cliente.py     # Perfil del usuario, hash compatible con Semillero, lectura de atv.perfil_*
+    │   │   ├── perfilamiento.py      # Conversación de perfilamiento por sesión (preguntas, extracción LLM)
+    │   │   ├── prompt_config.py      # Gestor de configuración y validación de prompts desde PostgreSQL
+    │   │   └── rag_service.py        # Scope gate, Hybrid RAG, Groundedness Gate & HITL routing
     │   └── main.py                   # FastAPI REST API Gateway (/api/v1/consultar)
     ├── dags/
-    │   └── dag_ingesta.py            # DAG orquestador en Airflow (VPS2) con delegación SSH a VPS4
+    │   ├── dag_ingesta.py            # DAG orquestador en Airflow (VPS2) con delegación SSH a VPS4
+    │   └── dag_perfil_productor.py   # DAG diario (01:30) que reconstruye atv.perfil_* desde stg_cafe
+    ├── docs/
+    │   └── instrucciones_admin_vps2_perfil_atv.pdf  # pg_hba.conf y GRANT para el admin de PostgreSQL
     ├── scripts/
+    │   ├── 001_create_atv_schema.sql # Esquema base DDL (PostgreSQL)
+    │   ├── 002_create_prompt_config.sql # DDL y semillas para atv.prompt_config
+    │   ├── 003_create_perfil.sql     # atv.perfil_*, atv.sesion_perfil y claves de perfilamiento
+    │   ├── 004_prompt_vendedor.sql   # Rol de vendedor, trato de usted, filtro de alcance
+    │   ├── construir_perfiles.py     # stg_cafe (base semillero) -> atv.perfil_* (base staging)
+    │   ├── semillero/004_cafe_perfil_finca.sql # Registro de las tablas de finca en el catálogo de Semillero
     │   ├── airflow_tasks.py          # Entrypoint CLI de ejecución remota en VPS4 para tareas de Airflow
     │   ├── bootstrap_qdrant.py       # Idempotent collection bootstrap and alias attachment
     │   ├── inspect_qdrant.py         # Diagnostic CLI tool for collections, count, and payloads
-    │   ├── sync_dag_airflow.py       # Verificación y copia de dag_ingesta.py de VPS4 a VPS2
-    │   ├── ingest_seaweedfs.py       # Pipeline de ingesta offline y sync SeaweedFS S3 -> Qdrant
-    │   └── ingest_sharepoint.py      # Offline synchronization & Qdrant collection builder
+    │   ├── sync_dag_airflow.py       # Copia un DAG de VPS4 a VPS2 (--archivo, por defecto dag_ingesta.py)
+    │   ├── ingest_seaweedfs.py       # Pipeline de ingesta offline y sync SeaweedFS S3 -> Qdrant (soporta --reset)
+    │   ├── ingest_sharepoint.py      # Offline synchronization & Qdrant collection builder
+    │   ├── reset_inventory.py        # Herramienta de reinicio completo: purga PostgreSQL, Qdrant y Redis
+    │   └── reiniciar_cargas.py       # Alias CLI interactivo y directo para reiniciar cargas de ingesta
     ├── fixtures/                     # Local sample PDFs and test data
     ├── docker-compose.yml            # Local dev topology (Postgres 16, Qdrant 1.9.1, Redis 7)
     ├── requirements.txt              # Pinned Python ecosystem dependencies
@@ -425,19 +461,90 @@ python3 -m scripts.sync_dag_airflow --key ~/.ssh/id_cluster --dags-dir /apps/air
 
 ---
 
-### 9.5. Integración en el Pipeline de Ingesta
+### 9.5. Modos de Ejecución: Pipeline Directo Local (VPS4) vs. DAG Calendarizado (Airflow VPS2)
 
-El proceso principal de ingesta offline ([`scripts/ingest_seaweedfs.py`](file:///var/www/aldeazon-atv/scripts/ingest_seaweedfs.py)) invoca automáticamente esta verificación al inicio de su flujo:
+El sistema de ingesta y generación de embeddings soporta **dos modalidades operativas complementarias** que comparten el mismo núcleo algorítmico:
 
-```bash
-python3 -m scripts.ingest_seaweedfs
-```
-
-Antes de escanear o descargar archivos de SeaweedFS, el script valida que Airflow en VPS2 tenga el DAG disponible para orquestar las tareas subsecuentes.
+| Criterio | Modo 1: Reproceso Manual Directo (`ingest_seaweedfs.py`) | Modo 2: Orquestación Calendarizada (`dag_ingesta.py`) |
+| :--- | :--- | :--- |
+| **Punto de Ejecución** | Servidor local **VPS4** (`.venv/bin/python`) | **Apache Airflow** en **VPS2** despachando vía SSH a VPS4 |
+| **Propósito Principal** | Reconstrucciones completas inmediatas, setup inicial, depuración o tras vaciado total de la base de datos. | Ingesta desatendida diaria, detección incremental de deltas y gobierno con supervisión humana. |
+| **Planificación Temporal** | Ejecución inmediata bajo demanda por consola | Calendarizado diario a las **2:00 AM UTC** (`0 2 * * *`) |
+| **Paralelismo** | Secuencial por archivo con sub-lotes por PDF | *Dynamic Task Mapping* (Airflow genera 1 tarea concurrente por cada PDF) |
+| **Puerta de Control HITL** | Omitida (construye y promueve directamente a Qdrant) | Incluye sensor horario (`t4_sensor_validacion_hitl`) para aprobación previa |
+| **Detección de Cambios** | Procesa PDFs nuevos/modificados y salta los ya en `INDEXADO` | Emite `AirflowSkipException` si no hay cambios, finalizando con éxito en $< 5\text{ s}$ |
 
 ---
 
-### 9.6. Variables de Entorno (`.env`)
+### 9.6. Guía Paso a Paso: Reprocesos Manuales Directos en VPS4
+
+Utilice este flujo cuando necesite reconstruir el corpus vectorial de forma inmediata sin esperar la ventana horaria ni el sensor de Airflow:
+
+#### Paso 1: Diagnosticar el Estado Actual
+Verifique el contenido del inventario en PostgreSQL y las colecciones en Qdrant:
+```bash
+# Inspeccionar estado de colecciones vectoriales en Qdrant
+python -m scripts.inspect_qdrant
+```
+
+#### Paso 2: (Opcional) Purgar Cargas Anteriores
+Si la base de datos vectorial quedó desincronizada o se actualizaron los algoritmos de extracción y se requiere empezar 100% desde cero:
+```bash
+# Simular qué se eliminaría (Dry Run)
+python -m scripts.reiniciar_cargas
+
+# Ejecutar el borrado definitivo en PostgreSQL, Qdrant y Redis
+python -m scripts.reiniciar_cargas --confirm
+```
+
+#### Paso 3: Ejecutar la Ingesta Directa
+Ejecute el proceso principal en VPS4. Existen dos alternativas:
+
+* **Opción A (Recomendada tras purga):** Ejecutar la ingesta estándar:
+  ```bash
+  python -m scripts.ingest_seaweedfs
+  ```
+* **Opción B (Todo en uno):** Purgar la carga previa e iniciar la ingesta en un único comando:
+  ```bash
+  python -m scripts.ingest_seaweedfs --reset
+  ```
+
+#### Paso 4: Monitorear el Proceso en Segundo Plano
+La extracción y vectorización de decenas de PDFs técnicos puede tardar varios minutos:
+```bash
+# Verificar que el proceso sigue activo y qué recursos consume
+ps aux | grep ingest_seaweedfs
+
+# Consultar el avance en PostgreSQL (en otra terminal)
+python -c "
+from app.core.config import settings
+from sqlalchemy import create_engine, text
+with create_engine(settings.database_url).connect() as conn:
+    print(conn.execute(text('SELECT estado, count(*) FROM atv.inventario_archivo GROUP BY estado')).fetchall())
+"
+```
+
+#### Paso 5: Validar la Colección y el Agente RAG
+Una vez completado el proceso:
+```bash
+# 1. Comprobar que Qdrant tiene los puntos vectoriales y el alias activo
+python -m scripts.inspect_qdrant
+
+# 2. Realizar una consulta de prueba al API
+curl -i -X POST "http://127.0.0.1:8100/api/v1/consultar" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: aldeazon_internal_app_secret_2026" \
+  -d '{
+    "vendedor_id": "usr_test_01",
+    "sucursal_id": 1,
+    "consulta": "¿Cuál es la dosis foliar recomendada de Engorlid para café?",
+    "sesion_id": "sess_01"
+  }'
+```
+
+---
+
+### 9.7. Variables de Entorno (`.env`)
 
 Configuración correspondiente en el archivo [`.env`](file:///var/www/aldeazon-atv/.env):
 
@@ -452,7 +559,7 @@ AIRFLOW_DAGS_DIR="/apps/airflow/dags"
 
 ---
 
-### 9.7. Arquitectura Desacoplada: Orquestación (VPS2) vs. Cómputo RAG (VPS4)
+### 9.8. Arquitectura Desacoplada: Orquestación (VPS2) vs. Cómputo RAG (VPS4)
 
 #### Motivación del Desacoplamiento:
 El contenedor de Airflow en VPS2 (`semillero_airflow`) corre Python 3.10 y alberga servicios compartidos del cluster (OpenMetadata 1.13.1, providers de AWS y Amazon). Instalar directamente en el contenedor las librerías de IA y RAG de ATV (`fastembed`, `qdrant-client`, `pdfplumber`, `pypdfium2`, `spacy`, `torch`/`onnxruntime`) provocaba conflictos destructivos de dependencias (degradación de `boto3`/`botocore`).
@@ -468,7 +575,7 @@ El contenedor de Airflow en VPS2 (`semillero_airflow`) corre Python 3.10 y alber
 
 ---
 
-### 9.8. Módulo de Tareas en VPS4 (`scripts/airflow_tasks.py`)
+### 9.9. Módulo de Tareas en VPS4 (`scripts/airflow_tasks.py`)
 
 Punto de entrada unificado que expone cada fase del pipeline como un subcomando CLI ejecutable:
 
@@ -479,12 +586,45 @@ Punto de entrada unificado que expone cada fase del pipeline como un subcomando 
 | `extraer_pdf <archivo>` | `task_extraer_pdf(filename)` | Ejecuta la extracción dual (determinista vía `pdfplumber` o visión LLM vía `pypdfium2` + GPT-4o-mini), registrando los registros atómicos. |
 | `validar_hitl` | `task_validar_hitl()` | Consulta PostgreSQL para validar si existen registros pendientes de validación humana (`estado IN ('en_revision', 'EN_REVISION')`). Emite `True` o `False`. |
 | `construir_y_promover` | `task_construir_y_promover()` | Genera embeddings densos (`intfloat/multilingual-e5-large`), crea la colección versionada en Qdrant, realiza el cambio atómico de alias (`atv_corpus`) y purga la caché Redis. |
+| `reiniciar_cargas` | `ejecutar_reinicio_completo()` | Purga física de `atv.inventario_archivo`, errores de ingesta en `atv.error_log`, eliminación de colecciones en Qdrant y purga de caché Redis. |
 
 ---
 
-### 9.9. Flujo y Ciclo de Vida del DAG (`dags/dag_ingesta.py`)
+### 9.10. Configuración y Despliegue del DAG en Airflow Paso a Paso (`dags/dag_ingesta.py`)
 
-El DAG `atv_corpus_ingestion_pipeline` se estructura en el siguiente grafo secuencial:
+Siga esta guía paso a paso para configurar, sincronizar y operar el DAG en Apache Airflow:
+
+#### Paso 1: Configurar Conectividad SSH y Credenciales
+Asegúrese de que el par de claves esté habilitado en ambos extremos:
+1. En VPS4, confirme que existe la clave del cluster: `~/.ssh/id_cluster`.
+2. En VPS2, asegúrese de que el contenedor de Airflow tenga montada la clave en `/opt/airflow/dags/.id_cluster` con permisos `600`.
+3. Verifique el enlace bidireccional:
+   ```bash
+   # Comprobar VPS4 -> VPS2
+   ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 "echo 'CONEXION_OK'"
+
+   # Comprobar contenedor Airflow en VPS2 -> VPS4
+   ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+     "docker exec semillero_airflow ssh -p 5775 -i /opt/airflow/dags/.id_cluster -o StrictHostKeyChecking=no ostendata@10.0.0.15 'echo CONEXION_OK'"
+   ```
+
+#### Paso 2: Sincronizar el DAG hacia Airflow (VPS2)
+Cada vez que se modifique [`dags/dag_ingesta.py`](file:///var/www/aldeazon-atv/dags/dag_ingesta.py), despliéguelo hacia el directorio de DAGs de Airflow:
+```bash
+python -m scripts.sync_dag_airflow --force
+```
+Este script copia el archivo a `/apps/airflow/dags/` en VPS2 (montado en `/opt/airflow/dags/` dentro del contenedor).
+
+#### Paso 3: Validar que el DAG fue Indexado en Airflow
+Verifique en el planificador de Airflow que el DAG está reconocido y no tiene errores de sintaxis (*import errors*):
+```bash
+ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
+  "docker exec semillero_airflow airflow dags list | grep atv_corpus"
+```
+Debe listar: `atv_corpus_ingestion_pipeline`.
+
+#### Paso 4: Comprender el Ciclo de Vida y Grafo de Tareas
+El DAG `atv_corpus_ingestion_pipeline` ejecuta el siguiente flujo secuencial:
 
 ```text
 [t1_sincronizar_s3]
@@ -497,40 +637,337 @@ El DAG `atv_corpus_ingestion_pipeline` se estructura en el siguiente grafo secue
         └── (Si hay archivos pendientes)
                 │
                 ▼
-        [t3_extraer_pdf]  (Dynamic Task Mapping: expande 1 tarea por PDF)
+        [t3_extraer_pdf]  (Dynamic Task Mapping: 1 tarea paralela por PDF)
                 │
                 ▼
-        [t4_sensor_validacion_hitl]  (Sensor: verifica cada 1h resolución humana)
+        [t4_sensor_validacion_hitl]  (Sensor horario: espera aprobación humana)
                 │
                 ▼
-        [t5_construir_indice_y_promover]  (Qdrant Index & Alias Switch)
+        [t5_construir_indice_y_promover]  (Vectorización, Alias Switch & Purga Redis)
 ```
 
-* **Idempotencia y Skip Elegante:** Cuando no se detectan fichas técnicas nuevas o modificadas en S3, la tarea `t2` emite `AirflowSkipException("Sin archivos pendientes para procesar.")`. Airflow salta las fases de extracción, sensor y promoción, concluyendo la ejecución en estado **`success`** sin generar falsas alarmas ni bloqueos.
+* **Comportamiento Idempotente:** Si SeaweedFS no contiene archivos modificados, `t2` emite `AirflowSkipException`. Airflow finaliza el ciclo en estado **`success` (Skipped)** en pocos segundos, ahorrando costos de LLM y procesamiento.
+* **Control de Calidad (HITL):** Si alguna ficha requiere verificación agronómica manual, la tarea `t4` entra en suspensión (`mode="reschedule"`) y reintenta cada hora sin consumir recursos de worker.
 
----
-
-### 9.10. Comandos Operativos de Validación y Monitoreo CLI
-
-Para monitorear o disparar el pipeline directamente desde la terminal de VPS4:
+#### Paso 5: Comandos Operativos de Monitoreo y Disparo Manual en Airflow
+Comandos para controlar el pipeline directamente desde la consola de VPS4:
 
 ```bash
-# 1. Sincronizar / actualizar el DAG hacia Airflow (VPS2)
-python3 -m scripts.sync_dag_airflow --force
-
-# 2. Disparar manualmente una ejecución del pipeline
+# 1. Disparar manualmente una ejecución del DAG fuera de horario
 ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
   "docker exec semillero_airflow airflow dags trigger atv_corpus_ingestion_pipeline"
 
-# 3. Listar el historial y estado de ejecuciones del DAG
+# 2. Listar las últimas ejecuciones del DAG y su estado (success, running, failed)
 ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
   "docker exec semillero_airflow airflow dags list-runs atv_corpus_ingestion_pipeline"
 
-# 4. Inspeccionar el estado individual de cada tarea de una ejecución específica
+# 3. Ver el estado detallado de cada tarea dentro de una ejecución específica
 ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
   "docker exec semillero_airflow airflow tasks states-for-dag-run atv_corpus_ingestion_pipeline <RUN_ID>"
 
-# 5. Probar una tarea individual en modo de prueba (Dry Run)
+# 4. Probar una tarea individual en modo de prueba (Dry Run)
 ssh -p 9959 -i ~/.ssh/id_cluster ostendata@10.0.0.13 \
   "docker exec semillero_airflow airflow tasks test atv_corpus_ingestion_pipeline t1_sincronizar_s3"
 ```
+
+---
+
+### 9.11. Reinicio y Purga Completa del Pipeline de Ingesta (`scripts/reiniciar_cargas.py` / `scripts/reset_inventory.py`)
+
+Cuando se requiere reconstruir el corpus vectorial desde cero (por ejemplo, si la colección de Qdrant quedó vacía pero PostgreSQL registraba una carga previa, tras corregir algoritmos de extracción o para resolver discrepancias en el inventario), se utiliza el módulo de reinicio.
+
+#### Acciones Ejecutadas por el Reinicio:
+1. **PostgreSQL (`atv.inventario_archivo`):** Elimina físicamente todos los registros de fichas técnicas previas (o restablece su estado a `NUEVO` si se utiliza `--reset-status`).
+2. **PostgreSQL (`atv.error_log`):** Purga registros de errores previos asociados al proceso de ingesta y tareas de Airflow (`componente LIKE '%ingest%'` o `%airflow%`).
+3. **Qdrant Vector DB:** Elimina de forma segura cualquier colección y alias previo (`atv_corpus`, `atv_corpus_v1`, etc.), evitando colisiones al reasignar el alias.
+4. **Redis Cache:** Ejecuta `flushdb` para purgar la caché semántica previa y asegurar que las nuevas respuestas provengan del corpus actualizado.
+5. **Fixtures / Staging (Opcional):** Con `--clean-staging`, elimina los PDFs locales en `fixtures/staging` para forzar la re-descarga completa desde SeaweedFS S3.
+
+#### Comandos Disponibles:
+
+```bash
+# 1. Simulación (Dry Run): muestra qué registros, colecciones y caches se purgarían sin alterar nada
+python -m scripts.reiniciar_cargas
+
+# 2. Reinicio y purga definitiva (PostgreSQL + Qdrant + Redis):
+python -m scripts.reiniciar_cargas --confirm
+
+# 3. Soft-Reset: Mantiene los registros en PostgreSQL pero restablece su estado a 'NUEVO' y limpia Qdrant:
+python -m scripts.reiniciar_cargas --confirm --reset-status
+
+# 4. Reinicio completo eliminando también los PDFs locales en staging:
+python -m scripts.reiniciar_cargas --confirm --clean-staging
+
+# 5. Reinicio + Ingesta completa en un solo comando:
+python -m scripts.ingest_seaweedfs --reset
+
+# 6. Ejecución delegada a través de las tareas de Airflow:
+python -m scripts.airflow_tasks reiniciar_cargas
+```
+
+---
+
+## 10\. Configuración Dinámica de Prompts en PostgreSQL (`atv.prompt_config`)
+
+Toda la configuración del system prompt, plantillas de interacción con el LLM, mensajes de error y parámetros de generación de `rag_service.py` se gestiona en la tabla `atv.prompt_config` de PostgreSQL.
+
+* **Fuente única de verdad:** No existen valores hardcodeados en el código como fallback. Si la base de datos no está disponible o falta una clave requerida, la API responde de forma controlada con **HTTP 503** y registra el evento en `atv.error_log`.
+* **Sin reinicios de servicio:** La configuración se consulta en cada llamada, permitiendo actualizar prompts y parámetros en caliente sin re-desplegar la aplicación.
+
+### 10.1. Claves Configurables
+
+| Clave | Tipo | Descripción | Ejemplo / Valor Inicial |
+| :--- | :--- | :--- | :--- |
+| `system_prompt` | `texto` | Rol (asesor de ventas de AldeaZON), trato de usted y reglas de respuesta (ver §11.6) | `Eres el asesor de ventas de AldeaZON...` |
+| `user_prompt_template` | `plantilla` | Formato del prompt de usuario. Requiere `{contexto}`, `{consulta}` y `{perfil}` | `CONTEXTO RECUPERADO:\n{contexto}\n\nCONSULTA DEL CLIENTE:\n{consulta}\n\nPERFIL DEL USUARIO:\n{perfil}` |
+| `chunk_template` | `plantilla` | Formato de serialización de cada chunk recuperado de Qdrant | `[Documento: {documento_fuente} \| Producto: {producto}...]` |
+| `msg_retrieval_error` | `texto` | Respuesta ante fallo de conexión con el motor vectorial Qdrant | `El servicio de consulta técnica está temporalmente indisponible...` |
+| `msg_baja_confianza` | `texto` | Respuesta cuando la confianza de similitud no supera el umbral | `No tengo suficiente información respaldada en el corpus...` |
+| `msg_llm_error` | `texto` | Respuesta ante fallo o timeout del proveedor LLM | `Error temporal de conexión con el generador técnico...` |
+| `msg_groundedness_rechazo` | `texto` | Respuesta cuando el filtro de dosis detecta una alucinación numérica | `La dosis generada requiere verificación técnica...` |
+| `llm_modelo` | `texto` | Modelo de OpenAI para generación | `gpt-4o-mini` |
+| `llm_temperature` | `float` | Temperatura de muestreo del modelo (ej. `0.2`) | `0.2` |
+| `llm_max_tokens` | `int` | Límite máximo de tokens de salida | `250` |
+| `retrieval_top_k` | `int` | Cantidad de chunks a recuperar desde Qdrant | `3` |
+
+Las claves del perfilamiento y del filtro de alcance están en la sección 11.10. Al editar `system_prompt`, `user_prompt_template`, `chunk_template`, `llm_modelo`, `llm_temperature` o `retrieval_top_k`, las respuestas cacheadas en Redis con la versión anterior dejan de usarse (la clave de caché incluye una huella de estas claves).
+
+### 10.2. Actualización de Configuración
+
+Para modificar cualquier parámetro en caliente:
+
+```sql
+-- Ejemplo: Modificar el system prompt
+UPDATE atv.prompt_config
+SET valor = 'Nuevo system prompt...',
+    ts_actualizado = CURRENT_TIMESTAMP,
+    actualizado_por = 'admin'
+WHERE clave = 'system_prompt';
+
+-- Ejemplo: Cambiar el modelo LLM y temperatura
+UPDATE atv.prompt_config SET valor = 'gpt-4o', ts_actualizado = CURRENT_TIMESTAMP WHERE clave = 'llm_modelo';
+UPDATE atv.prompt_config SET valor = '0.1', ts_actualizado = CURRENT_TIMESTAMP WHERE clave = 'llm_temperature';
+```
+---
+
+## 11\. El Agente: Perfilamiento, Flujo de Respuesta y Datos de Semillero
+
+El ATV atiende a **cualquier persona desde la web de AldeaZON** (socio, cliente, productor, comerciante o técnico) como un **asesor de ventas de AldeaZON con conocimiento técnico de café y de los productos**. Antes de recomendar, **siempre** averigua quién pregunta y cómo es su finca o negocio, y adapta la respuesta a ese perfil.
+
+### 11.1. Vista general
+
+```mermaid
+flowchart TD
+    W[Web AldeaZON<br/>POST /api/v1/consultar] --> S{¿Sesión completa?<br/>atv.sesion_perfil}
+    S -- no --> P[Perfilamiento<br/>perfilamiento.py]
+    P --> I{¿Cédula + WhatsApp?}
+    I -- sí --> H[HMAC-SHA256 con el salt de Semillero<br/>busca en atv.perfil_productor]
+    H -- coincide --> R[Perfil del registro:<br/>rubros, fincas, lotes, zona]
+    H -- no coincide --> X
+    I -- no --> X[LLM extrae lo declarado<br/>perfil_extraccion_prompt]
+    R --> F{¿Falta algún dato?}
+    X --> F
+    F -- sí --> Q[Devuelve la siguiente pregunta<br/>etapa = perfilamiento]
+    F -- no --> G
+    S -- sí --> G[RAG con perfil<br/>rag_service.py]
+    G --> A{Filtro de alcance<br/>alcance_prompt}
+    A -- fuera --> FA[msg_fuera_alcance]
+    A -- dentro --> C[Caché → Qdrant → umbral → LLM →<br/>abstención → groundedness → carrito]
+    C --> RES[Respuesta etapa = respuesta]
+
+    subgraph Datos diarios
+      M[(VPS1 MariaDB<br/>ssp / catalogos)] -- Semillero 20:00 y 23:30 --> STG[(semillero.stg_cafe<br/>fotos diarias, PII hasheada)]
+      STG -- DAG atv_perfil_productor 01:30 --> AP[(staging.atv.perfil_*)]
+    end
+    AP -.-> H
+```
+
+### 11.2. Contrato de la API
+
+`POST /api/v1/consultar` (header `X-API-Key`). La web guarda el `sesion_id` de la primera respuesta y lo reenvía en cada mensaje.
+
+| Campo request | Obligatorio | Descripción |
+| --- | --- | --- |
+| `consulta` | sí | Texto del usuario (2 a 1.000 caracteres) |
+| `sesion_id` | no | Vacío = sesión nueva; la API genera uno y lo devuelve |
+| `sucursal_id` | no | Sucursal de AldeaZON para el carrito. Si falta, se usa la del socio identificado |
+| `vendedor_id` | no | `"web"` por defecto (o el id del vendedor en tienda) |
+
+| Campo response | Descripción |
+| --- | --- |
+| `respuesta` | Pregunta de perfilamiento o respuesta técnica |
+| `etapa` | `perfilamiento` (el agente está preguntando) o `respuesta` (respuesta técnica del RAG) |
+| `sesion_id` | Id a reenviar en el siguiente mensaje |
+| `perfil` | Perfil acumulado, **sin datos personales** (sin `persona_id`, cédula, teléfono ni coordenadas) |
+| `fuente` | Ficha técnica principal y versión |
+| `escalada_hitl` | `true` si la consulta debe pasar a Asistencia Técnica |
+| `carrito` | Productos sugeridos con stock (vacío si escaló o no es recomendación) |
+| `latencia_ms` | Tiempo total |
+
+### 11.3. Paso a paso de un mensaje
+
+`app/main.py` → `procesar_consulta_interna`:
+
+1. **Configuración.** Lee `atv.prompt_config` (`cargar_prompt_config`). Si falta una clave o es inválida → **HTTP 503** y registro en `atv.error_log`.
+2. **Perfilamiento** (`Perfilador.procesar_turno`, sección 11.4). Si todavía falta información devuelve la siguiente pregunta (`etapa = perfilamiento`) y termina el turno. El estado de la sesión se guarda (commit) **antes** de pasar al RAG.
+3. **RAG** (`ATVRagService.procesar_consulta`, sección 11.5) con la consulta pendiente o el mensaje actual y el perfil.
+4. **Trazabilidad.** Cada respuesta del RAG se registra en `atv.consulta` (texto sanitizado, intención, confianza, tokens, costo, latencias por fase, productos sugeridos); los errores, en `atv.error_log`. Los turnos de perfilamiento no van a `atv.consulta`: su rastro queda en `atv.sesion_perfil`.
+
+### 11.4. Perfilamiento (`app/services/perfilamiento.py`, `app/services/perfil_cliente.py`)
+
+**Orden de preguntas** (cada dato se pregunta **una sola vez**; como máximo `perfil_max_preguntas` = 4 preguntas, después responde con lo que haya):
+
+| Turno | Pregunta | Clave en `atv.prompt_config` | Se omite si… |
+| --- | --- | --- | --- |
+| 1 (sesión nueva) | ¿Es socio/cliente de Aldea Global? Cédula + WhatsApp. Si no, ¿a qué se dedica? | `perfil_msg_bienvenida` | el primer mensaje ya identifica a un socio |
+| — | Pide el WhatsApp si solo escribió la cédula | `perfil_msg_pedir_telefono` | — |
+| si falta | Cultivos y manzanas | `perfil_msg_pedir_cultivo` | el registro trae rubros |
+| si falta | Municipio o departamento | `perfil_msg_pedir_ubicacion` | el registro trae zona |
+| opcional | Etapa del cultivo y terreno (plano/quebrado, suelo, altura) | `perfil_msg_pedir_terreno` | tiene finca registrada, es comerciante o técnico, o ya lo dijo |
+| fin | Responde la consulta técnica hecha en el camino; si no hubo, pide la consulta | `perfil_msg_completo` | — |
+
+**Identificación de socios y clientes**
+
+* La cédula (`001-010190-0000A`, con o sin guiones) y el teléfono (8 dígitos, acepta `+505`, guiones y espacios) se leen del **texto crudo** y se convierten de inmediato en **HMAC-SHA256 con el salt de Semillero** (`SEMILLERO_HASH_SALT`), igual que `core/masking.py` de Semillero. Se prueban las variantes de formato con que la cédula puede estar en el origen (mayúscula/minúscula, con/sin guiones).
+* Se exige **cédula y teléfono**: solo con la cédula nadie puede ver la finca de otra persona. Máximo **3 intentos** por sesión (frena la enumeración de cédulas).
+* Si coinciden, el perfil sale del registro (`fuente = registro`, `verificado = true`) y el agente confirma: *"Gracias, encontré su registro. Tengo esta información: socio activo de Aldea Global; 1 finca(s) registrada(s); en San Rafael del Norte, Jinotega."* (`perfil_msg_verificado`, placeholder `{resumen}`).
+* Si no coinciden o no hay salt: `perfil_msg_no_encontrado` y sigue con preguntas.
+* La sesión guarda los hashes de la cédula solo mientras espera el teléfono; después los borra.
+
+**Lo que dice el usuario.** Cada mensaje (ya sanitizado) pasa por un LLM con `perfil_extraccion_prompt` que devuelve JSON: `tipo_usuario` (`socio`, `cliente`, `productor`, `comerciante`, `tecnico`, `otro`), `cultivos` (nombre, área, unidad `mz`/`ha`; las hectáreas se convierten a manzanas: 1 mz = 0,7026 ha), `municipio`, `departamento`, `etapa_cultivo`, `topografia`, `tipo_suelo`, `altura_msnm`, `tipo_negocio` y `consulta_tecnica` (la pregunta agronómica, que queda pendiente hasta completar el perfil). Lo declarado nunca pisa lo del registro. Si el LLM falla, el turno sigue y se vuelve a preguntar.
+
+**Qué recibe el LLM de generación** (`{perfil}` en `user_prompt_template`), por ejemplo:
+
+```
+- Quién pregunta: socio activo de Aldea Global
+- Cultivos: Café (7.4 mz), Frijol (2 mz)
+- Ubicación: Jinotega
+- Producción orgánica: sí (priorizar productos permitidos en agricultura orgánica)
+- Finca 1: 12 mz en total, 7.5 mz de café, 1150 msnm, pendiente 30 %, topografía SemiQuebrado, suelo Franco Arcilloso
+  - Lote: 2.5 mz, variedad Catuai, etapa Productivo Selectivo, sembrado en 2019
+```
+
+Hasta 3 fincas y 5 lotes por finca. Nunca incluye nombres, cédula, teléfonos, coordenadas ni `persona_id`.
+
+### 11.5. Pipeline de respuesta (`app/services/rag_service.py`)
+
+| # | Fase | Qué hace | Si falla o no pasa |
+| --- | --- | --- | --- |
+| 1 | Sanitización Ley 787 | `sanitizar_pii`: cédula → `[CEDULA]`, teléfono → `[TELEFONO]`, nombres (spaCy) → `[NOMBRE]` | — |
+| 2 | Intención | Regex de riesgo (`dosis`, `qué producto`, `aplicar`, `l/ha`…) → `recomendacion`; si no, `informativa` | — |
+| 3 | **Filtro de alcance** | Llamada aparte con `alcance_prompt` → `{"en_alcance": bool}`. Agro y Aldea Global = dentro; deportes, política, tareas, etc. = fuera | Fuera → `msg_fuera_alcance`, `intencion = fuera_alcance`, sin escalar. Si el filtro falla, **deja pasar** |
+| 4 | Caché Redis | Solo consultas `informativa`. Clave = consulta + perfil + **huella de los prompts** (editar `prompt_config` invalida lo cacheado). TTL 7 días | — |
+| 5 | Búsqueda Qdrant | Embedding `multilingual-e5-large` de la consulta **+ cultivo principal del perfil**; `retrieval_top_k` fichas | Error → `msg_retrieval_error`, escala |
+| 6 | Umbral de confianza | Score ≥ **0,70** (recomendación) / **0,55** (informativa) | Por debajo → `msg_baja_confianza`, escala sin llamar al LLM |
+| 7 | Generación | `system_prompt` + `user_prompt_template` (`{contexto}`, `{consulta}`, `{perfil}`), `llm_modelo`, timeout 6 s | Error → `msg_llm_error`, escala |
+| 8 | Abstención | Si la respuesta dice *"No tengo esa información en las fichas vigentes…"* → escala a Asistencia Técnica | — |
+| 9 | Groundedness | Toda dosis de la respuesta (`x L/ha`, `kg/mz`…) debe estar **literal** en las fichas recuperadas | Dosis inventada → `msg_groundedness_rechazo`, escala |
+| 10 | Carrito | Solo `recomendacion` con sucursal: productos con el ingrediente activo de la ficha top-1, `estado = 1`, stock > 0, del más barato al más caro. **Precio de asociado solo para socios activos verificados** | Error de catálogo → carrito vacío (la respuesta técnica sale igual) |
+| 11 | Guardar en caché | Solo `informativa` | — |
+
+### 11.6. Reglas para responder
+
+Viven en `atv.prompt_config` (`scripts/004_prompt_vendedor.sql`), se editan en caliente y se aplican desde la siguiente consulta:
+
+* **Rol:** asesor de ventas de AldeaZON, con conocimiento de café y de los productos, atendiendo a un cliente.
+* **Trato:** siempre de **usted**; nunca tutea ("puede", "aplique", "valide"; nunca "puedes", "aplica", "valida"). Cordial y profesional, máximo ~120 palabras.
+* **Alcance:** solo agro y temas de Aldea Global / AldeaZON (lo decide el filtro de la fase 3, no el LLM de generación: con `gpt-4o-mini` esa decisión dentro del mismo prompt rechazaba preguntas agrícolas cuyas fichas no coincidían).
+* **Solo con las fichas:** responde únicamente con el CONTEXTO; si no está, dice exactamente *"No tengo esa información en las fichas vigentes. Consulte al Área de Asistencia Técnica."*
+* **Nunca inventa** dosis, productos ni condiciones; toda cifra debe estar literal en las fichas.
+* **Fuente obligatoria** al cierre: `[Fuente: documento, versión v]`.
+* **Recomendaciones:** incluye *"Valide esta recomendación con Asistencia Técnica antes de aplicarla."* (esta frase **no** escala la consulta).
+* **Perfil:** adapta cultivo, etapa, terreno, zona y tipo de cliente; si el perfil no alcanza, lo dice y sugiere Asistencia Técnica. Nunca menciona datos personales.
+
+**Cuándo escala a Asistencia Técnica (`escalada_hitl = true`, carrito vacío):** baja confianza en la búsqueda, error de Qdrant o del LLM, abstención ("No tengo esa información…") o dosis no respaldada por la ficha.
+
+### 11.7. Tablas de Semillero usadas
+
+Todas se leen de la **última foto** (`max(_fecha_carga)`) del esquema `stg_cafe`, base **`semillero`** del PostgreSQL 10.0.0.14, con el rol `ostendata` (solo `SELECT`). Semillero aplica el enmascaramiento al ingerir: lo que figura como *hash* llega como HMAC-SHA256.
+
+| Tabla `stg_cafe` | Origen | Módulo / catálogo Semillero | Columnas usadas por el ATV | Enmascarado por Semillero |
+| --- | --- | --- | --- | --- |
+| `persona` | `ssp.persona` | `cosecha` (ya existía) | `id`, `cedula`, `whatsapp_claro`, `whatsapp_tigo`, `comunidad_id`, `sucursal_id`, `cafetalero` | hash: `nombre`, `cedula`, `foto`, `whatsapp_*`; `fecha_nac` generalizada |
+| `asociado` | `ssp.asociado` | `asociados` (ya existía) | `persona_id`, `estado_asociado`, `sucursal_id`, `es_organico`, `cafetalero`, `numero_mz` | hash: beneficiarios y sus cédulas; lat/long generalizadas |
+| `cliente` | `ssp.cliente` | `cosecha` (ya existía) | `id` (= persona.id), `tipo_cliente`, `celular` | hash: `celular`, `url_cedula`, `verificado_por` |
+| `comunidad` | `ssp.comunidad` | `cosecha` (ya existía) | `id`, `nombre`, `distrito_id` | — |
+| `finca` | `ssp.finca` | `perfil_finca`, id 135 | `id`, `asociado_persona_id`, `comunidad_id`, `altura`, `porc_pendiente`, `topografia`, `tipo_suelo`, áreas (`total_area_finca`, `area_cafe_*`, granos, frutas, pastos, bosque), `fecha_floracion`, `activo` | hash: `nombre`, `coordenadas`, `colindante_*`, `observaciones`, `creadoPor`, `actualizadoPor` |
+| `finca_lote` | `ssp.finca_lote` | `perfil_finca`, id 136 | `id`, `finca_id`, `nombre`, `area`, `fecha_siembra`, `plantas_x_mz`, `variedad_id`, `estado_id`, `rendimiento_esperado`, `activo` | — |
+| `finca_lote_estado` | `ssp.finca_lote_estado` | `perfil_finca`, id 137 | `id`, `nombre` (etapa del lote) | — |
+| `catalogo_variedad_cafe` | `ssp.catalogo_variedad_cafe` | `perfil_finca`, id 138 | `id`, `nombre` | — |
+| `asociado_mz_rubro` | `ssp.asociado_mz_rubro` | `perfil_finca`, id 139 | `asociado_id`, `rubro`, `mz_avg` | — |
+| `distrito` | `ssp.distrito` | `perfil_finca`, id 140 | `id`, `municipio_id` | — |
+| `municipio` | `ssp.municipio` | `perfil_finca`, id 141 | `id`, `nombre`, `departamento_id` | — |
+| `ssp_departamento` | `catalogos.ssp_departamento` | `perfil_finca`, id 142 | `id`, `nombre` | — |
+
+Relaciones: `persona.id` = `asociado.persona_id` = `cliente.id` = `finca.asociado_persona_id` = `asociado_mz_rubro.asociado_id`; `finca_lote.finca_id` → `finca.id`; `comunidad.distrito_id` → `distrito.municipio_id` → `municipio.departamento_id` → `ssp_departamento.id`.
+
+Notas de datos (medido el 2026-10-15): en producción **no existe `ssp.departamento`** (solo en la copia de develop), por eso se usa `catalogos.ssp_departamento`; `asociado_mz_rubro` no tiene PK en el origen (`asociado_id, rubro_id` es único); solo 2 de 1.835 lotes traen variedad.
+
+El registro en el catálogo está en `scripts/semillero/004_cafe_perfil_finca.sql` (aplicado en `semillero_control`). Lote de ingesta: `semillero_ingesta_cafe_perfil_finca_01`, diario a las 20:00 de Managua; `persona`, `cliente` y `comunidad` cargan con el módulo `cosecha` a las 23:30.
+
+### 11.8. Tablas del ATV (`staging.atv`, `scripts/003_create_perfil.sql`)
+
+| Tabla | Contenido | Escribe | Lee |
+| --- | --- | --- | --- |
+| `atv.perfil_productor` | Una fila por persona: `cedula_hash`, `telefono_hashes[]`, socio/estado, `tipo_cliente`, sucursal, orgánico, manzanas, comunidad/municipio/departamento, `rubros` (JSON) y `fecha_foto` | DAG | API (por `cedula_hash` indexado) |
+| `atv.perfil_finca` | Fincas activas: altura, pendiente, topografía, suelo, áreas, municipio/departamento | DAG | API |
+| `atv.perfil_lote` | Lotes activos: área, variedad, etapa, siembra, densidad, rendimiento esperado | DAG | API |
+| `atv.sesion_perfil` | Estado por sesión: `estado` (`perfilando`/`completo`), `perfil` (JSON), preguntas hechas, intentos de identificación, consulta pendiente (sanitizada) | API | API |
+
+La primera carga (2026-10-15) dejó 39.887 personas (22.565 socios activos), 6.304 fincas y 1.835 lotes.
+
+### 11.9. Carga diaria: DAG `atv_perfil_productor`
+
+* `dags/dag_perfil_productor.py`, en el Airflow de VPS2 (`semillero_airflow`), **01:30 America/Managua**, después de las cargas de Semillero. Una tarea que hace SSH a VPS4 y ejecuta `python -m scripts.airflow_tasks construir_perfiles` (`scripts/construir_perfiles.py`).
+* Lee la última foto de las 12 tablas de `stg_cafe` (base `semillero`) y reescribe `atv.perfil_*` (base `staging`) en **una sola transacción** (`DELETE` + `INSERT`: la API sigue leyendo los perfiles anteriores hasta el commit).
+* **Falla sin tocar los perfiles vigentes** si alguna tabla no tiene fotos, si su última foto tiene más de **2 días**, o si el número de personas baja a menos de la **mitad**. Reintenta 2 veces cada 15 minutos.
+* Corrida manual: `python -m scripts.airflow_tasks construir_perfiles` en VPS4. Publicar cambios del DAG: `python scripts/sync_dag_airflow.py --archivo dags/dag_perfil_productor.py --force`.
+
+### 11.10. Configuración
+
+**`.env` (VPS4, permisos `600`):**
+
+| Variable | Uso |
+| --- | --- |
+| `SEMILLERO_PG_HOST`, `SEMILLERO_PG_PORT`, `SEMILLERO_PG_DB`, `SEMILLERO_PG_USER`, `SEMILLERO_PG_PASSWORD` | Conexión de solo lectura a la base `semillero` (la arma `settings.semillero_database_url`; la contraseña se escapa sola) |
+| `SEMILLERO_HASH_SALT` | Salt de `hash_determinista` de Semillero (Variable de Airflow `semillero_masking_salt`). Sin él no se identifican socios. Si Semillero lo cambia, hay que actualizarlo aquí: si no coinciden, ningún socio se reconoce (sin error visible) |
+
+**Claves de `atv.prompt_config` agregadas por el agente** (además de las de la sección 10.1):
+
+| Clave | Tipo | Uso |
+| --- | --- | --- |
+| `perfil_msg_bienvenida`, `perfil_msg_pedir_telefono`, `perfil_msg_no_encontrado`, `perfil_msg_pedir_cultivo`, `perfil_msg_pedir_ubicacion`, `perfil_msg_pedir_terreno`, `perfil_msg_completo` | texto | Preguntas y mensajes del perfilamiento |
+| `perfil_msg_verificado` | plantilla | Confirmación al socio identificado; `{resumen}` obligatorio |
+| `perfil_extraccion_prompt` | texto | Extractor JSON de lo que declara el usuario |
+| `perfil_max_preguntas` | int | Tope de preguntas de perfil (4) |
+| `alcance_prompt` | texto | Filtro de alcance (JSON `{"en_alcance": bool}`) |
+| `msg_fuera_alcance` | texto | Respuesta a consultas fuera de alcance |
+
+`user_prompt_template` exige además el placeholder `{perfil}`.
+
+### 11.11. Despliegue y operación
+
+Orden usado en producción (2026-10-15 / 17):
+
+1. **Semillero:** `scripts/semillero/004_cafe_perfil_finca.sql` en `semillero_control` → `semillero_preparar_destino` (previsualizar y aplicar) → despausar `semillero_ingesta_cafe_perfil_finca_01`.
+2. **PostgreSQL 10.0.0.14:** regla `pg_hba.conf` para VPS4 → base `semillero` y `GRANT SELECT` de las 12 tablas al rol del ATV (instrucciones para el admin: `docs/instrucciones_admin_vps2_perfil_atv.pdf`).
+3. **ATV:** `scripts/003_create_perfil.sql` y `scripts/004_prompt_vendedor.sql` sobre `staging` **y reinicio inmediato** de `aldeazon-atv.service` (el código y las claves nuevas van juntos: el código viejo no conoce `{perfil}` y el nuevo exige las claves nuevas).
+4. **Carga inicial** (`construir_perfiles`) y publicación del DAG en VPS2.
+
+Comprobaciones útiles:
+
+```sql
+-- staging: frescura y volumen del perfil
+SELECT max(fecha_foto), count(*), count(*) FILTER (WHERE es_asociado) FROM atv.perfil_productor;
+-- staging: sesiones del día por estado
+SELECT estado, count(*) FROM atv.sesion_perfil WHERE ts_creado::date = current_date GROUP BY 1;
+-- staging: consultas fuera de alcance y escaladas
+SELECT intencion, escalada_hitl, count(*) FROM atv.consulta WHERE ts::date = current_date GROUP BY 1, 2;
+```
+
+### 11.12. Limitaciones conocidas
+
+* **Carrito vacío:** `catalog.py` consulta `stc2.agroquimico.ingrediente_activo` y `stc2.az_bodega_inventario`, pero esas tablas no están en la base `staging` y en el origen `agroquimico` no tiene `ingrediente_activo`. Falta definir de dónde sale el ingrediente activo y traer el catálogo por Semillero (proyecto `insumos`).
+* **Turnos de perfilamiento** no quedan en `atv.consulta` (solo en `atv.sesion_perfil`).
+* **Una vez completo**, el perfil de la sesión ya no se actualiza con lo que el usuario diga después (se responde con el perfil acumulado).
+* El filtro de alcance agrega ~0,5 s por consulta.

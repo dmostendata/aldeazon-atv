@@ -121,3 +121,49 @@ class ErrorLog(Base):
     mensaje: Mapped[str] = mapped_column(Text, nullable=False)
     stack_trace: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resuelto: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class PromptConfig(Base):
+    """
+    Configuración de prompts y parámetros LLM del RAG (scripts/002_create_prompt_config.sql).
+    Única fuente de verdad para rag_service.py: se lee en cada consulta, sin fallback en código.
+    """
+    __tablename__ = "prompt_config"
+    __table_args__ = {"schema": "atv"}
+
+    clave: Mapped[str] = mapped_column(String(64), primary_key=True)
+    valor: Mapped[str] = mapped_column(Text, nullable=False)
+    # 'texto', 'plantilla', 'float', 'int'
+    tipo: Mapped[str] = mapped_column(String(16), nullable=False)
+    descripcion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    ts_actualizado: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    actualizado_por: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+class SesionPerfil(Base):
+    """
+    Estado del perfilamiento por sesión de la web (scripts/003_create_perfil.sql).
+    Ley 787: guarda hashes de la cédula y texto sanitizado, nunca el dato en claro.
+    """
+    __tablename__ = "sesion_perfil"
+    __table_args__ = {"schema": "atv"}
+
+    sesion_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # 'perfilando', 'completo'
+    estado: Mapped[str] = mapped_column(String(16), default="perfilando", nullable=False)
+    perfil: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cedula_hashes: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list, nullable=False)
+    intentos_identificacion: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    preguntas_hechas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    preguntas: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list, nullable=False)
+    consulta_pendiente: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ts_creado: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    ts_actualizado: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc), nullable=False
+    )

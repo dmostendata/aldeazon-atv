@@ -1,7 +1,7 @@
 # scripts/airflow_tasks.py
 """
 Puntos de entrada CLI para las tareas de Airflow que se ejecutan en VPS4.
-Invocados remotamente por el DAG 'dag_ingesta.py' desde VPS2.
+Invocados remotamente por los DAGs 'dag_ingesta.py' y 'dag_perfil_productor.py' desde VPS2.
 """
 
 import sys
@@ -76,7 +76,7 @@ async def task_construir_y_promover():
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python -m scripts.airflow_tasks [sincronizar_s3|obtener_pendientes|extraer_pdf|validar_hitl|construir_y_promover]")
+        print("Uso: python -m scripts.airflow_tasks [sincronizar_s3|obtener_pendientes|extraer_pdf|validar_hitl|construir_y_promover|construir_perfiles|reiniciar_cargas]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -94,6 +94,12 @@ def main():
         asyncio.run(task_validar_hitl())
     elif cmd == "construir_y_promover":
         asyncio.run(task_construir_y_promover())
+    elif cmd == "construir_perfiles":
+        from scripts.construir_perfiles import construir_perfiles
+        print(json.dumps(asyncio.run(construir_perfiles())))
+    elif cmd == "reiniciar_cargas":
+        from scripts.reset_inventory import ejecutar_reinicio_completo
+        ejecutar_reinicio_completo(confirm=True, delete_db=True)
     else:
         logger.error(f"Comando desconocido: {cmd}")
         sys.exit(1)

@@ -1,6 +1,6 @@
 # app/schemas/domain.py
 import re
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
@@ -116,4 +116,13 @@ class ChatResponse(BaseModel):
     carrito: List[CarritoItem] = Field(
         default_factory=list, 
         description="Commercial SKUs suggested. STRICTLY EMPTY if escalada_hitl is True or query abstained."
+    )
+    sesion_id: Optional[str] = Field(None, description="Sesión de la conversación: la web la reenvía en cada mensaje")
+    etapa: str = Field(
+        "respuesta",
+        pattern="^(perfilamiento|respuesta)$",
+        description="'perfilamiento': el ATV está preguntando por el perfil; 'respuesta': respuesta técnica del RAG",
+    )
+    perfil: Optional[Dict[str, Any]] = Field(
+        None, description="Perfil acumulado del usuario (sin datos personales)"
     )

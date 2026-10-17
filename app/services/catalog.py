@@ -133,6 +133,7 @@ def construir_carrito_items(
     productos: List[ProductoComercial],
     requiere_validacion_tecnica: bool = False,
     cantidad_default: int = 1,
+    aplicar_precio_asociado: bool = True,
 ) -> List[CarritoItem]:
     """
     Transforms resolved commercial SKUs into actionable App AldeaZON cart items.
@@ -144,11 +145,11 @@ def construir_carrito_items(
     """
     carrito: List[CarritoItem] = []
     for prod in productos:
-        # Favor discounted cooperative member pricing if configured (> 0.0),
-        # otherwise fall back to standard public retail price.
+        # Favor discounted cooperative member pricing if configured (> 0.0) and the
+        # buyer is a member, otherwise fall back to standard public retail price.
         precio_aplicable = (
             prod.precio_asociado
-            if prod.precio_asociado > 0.0
+            if aplicar_precio_asociado and prod.precio_asociado > 0.0
             else prod.precio_publico
         )
 

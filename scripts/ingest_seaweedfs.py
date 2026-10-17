@@ -281,6 +281,13 @@ async def promover_indice_y_purgar_cache(version_nueva: int) -> None:
     coleccion_nueva = f"{ALIAS_NAME}_v{version_nueva}"
     qdrant = AsyncQdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
 
+    # Si existe una colección cruda con el mismo nombre que el alias, eliminarla para evitar colisión
+    aliases_resp = await qdrant.get_aliases()
+    existing_aliases = {a.alias_name: a.collection_name for a in aliases_resp.aliases}
+    if ALIAS_NAME not in existing_aliases and await qdrant.collection_exists(ALIAS_NAME):
+        logger.warning(f"Colección cruda '{ALIAS_NAME}' detectada sin alias. Eliminándola para adjuntar alias hacia '{coleccion_nueva}'...")
+        await qdrant.delete_collection(ALIAS_NAME)
+
     logger.info(f"Switching alias '{ALIAS_NAME}' to '{coleccion_nueva}'...")
     await qdrant.update_collection_aliases(
         change_aliases_operations=[
@@ -300,6 +307,20 @@ async def promover_indice_y_purgar_cache(version_nueva: int) -> None:
 
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Pipeline de ingesta SeaweedFS S3 -> Qdrant.")
+    parser.add_argument(
+        "--reset", "--reiniciar", action="store_true",
+        help="Reinicia y borra la carga anterior en PostgreSQL (atv.inventario_archivo) y limpia Qdrant antes de ingestar."
+    )
+    args, _ = parser.parse_known_args()
+
+    if args.reset:
+        logger.warning("Opción --reset activada: Eliminando carga anterior en PostgreSQL y limpiando Qdrant...")
+        from scripts.reset_inventory import ejecutar_reinicio_completo
+        await asyncio.to_thread(ejecutar_reinicio_completo, confirm=True, delete_db=True)
+        logger.info("Reinicio completado. Continuando con la ingesta desde cero...")
+
     try:
         from scripts.sync_dag_airflow import asegurar_dag_en_airflow
         logger.info("Verificando presencia de dag_ingesta.py en Airflow (VPS2)...")

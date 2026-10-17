@@ -36,3 +36,19 @@ def test_construir_carrito_items_selects_preferential_member_price():
     assert len(items) == 1
     assert items[0].sku_id == 402
     assert items[0].precio_unitario_usd == 24.50
+
+def test_construir_carrito_items_public_price_for_non_members():
+    """Web users who are not verified active members pay the public price."""
+    producto = ProductoComercial(
+        producto_id=402,
+        nombre_comercial="Consento 45 SC - 1 Litro",
+        ingrediente_activo="Propamocarb",
+        bodega_id=1,
+        cantidad_disponible=15,
+        precio_publico=28.00,
+        precio_asociado=24.50
+    )
+
+    items = construir_carrito_items([producto], aplicar_precio_asociado=False)
+
+    assert items[0].precio_unitario_usd == 28.00
