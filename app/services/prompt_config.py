@@ -42,6 +42,9 @@ class PromptConfig:
     perfil_msg_pedir_ubicacion: str
     perfil_msg_pedir_terreno: str
     perfil_msg_completo: str
+    perfil_msg_pedir_faltantes: str
+    perfil_msg_pedir_consulta: str
+    perfil_msg_pedir_identificacion: str
     perfil_extraccion_prompt: str
     perfil_max_preguntas: int
     alcance_prompt: str
@@ -52,6 +55,12 @@ class PromptConfig:
     producto_selector_prompt: str
     producto_linea_template: str
     msg_producto_tienda: str
+    inventario_template: str
+    msg_sin_existencias: str
+    msg_inventario_no_disponible: str
+    inventario_max_tiendas: int
+    inventario_alternativas_template: str
+    inventario_max_productos: int
 
 
 # Conversor esperado por clave. El tipo lo define el código (no la columna `tipo`),
@@ -76,6 +85,9 @@ _CONVERSORES: Dict[str, Callable[[str], object]] = {
     "perfil_msg_pedir_ubicacion": str,
     "perfil_msg_pedir_terreno": str,
     "perfil_msg_completo": str,
+    "perfil_msg_pedir_faltantes": str,
+    "perfil_msg_pedir_consulta": str,
+    "perfil_msg_pedir_identificacion": str,
     "perfil_extraccion_prompt": str,
     "perfil_max_preguntas": int,
     "alcance_prompt": str,
@@ -86,6 +98,12 @@ _CONVERSORES: Dict[str, Callable[[str], object]] = {
     "producto_selector_prompt": str,
     "producto_linea_template": str,
     "msg_producto_tienda": str,
+    "inventario_template": str,
+    "msg_sin_existencias": str,
+    "msg_inventario_no_disponible": str,
+    "inventario_max_tiendas": int,
+    "inventario_alternativas_template": str,
+    "inventario_max_productos": int,
 }
 
 # Placeholders que deben aparecer obligatoriamente en cada plantilla.
@@ -93,8 +111,11 @@ _PLACEHOLDERS_REQUERIDOS: Dict[str, FrozenSet[str]] = {
     "user_prompt_template": frozenset({"contexto", "consulta", "perfil"}),
     "chunk_template": frozenset(),
     "perfil_msg_verificado": frozenset({"resumen"}),
+    "perfil_msg_pedir_faltantes": frozenset({"preguntas"}),
     "faq_user_prompt_template": frozenset({"respuesta", "consulta", "perfil"}),
     "producto_linea_template": frozenset({"producto"}),
+    "inventario_template": frozenset({"tiendas"}),
+    "inventario_alternativas_template": frozenset({"productos"}),
 }
 
 # Placeholders permitidos: cualquier otro provocaría KeyError en .format().
@@ -102,8 +123,11 @@ _PLACEHOLDERS_PERMITIDOS: Dict[str, FrozenSet[str]] = {
     "user_prompt_template": frozenset({"contexto", "consulta", "perfil"}),
     "chunk_template": frozenset({"documento_fuente", "producto", "cultivo", "dosis", "condiciones"}),
     "perfil_msg_verificado": frozenset({"resumen"}),
+    "perfil_msg_pedir_faltantes": frozenset({"preguntas"}),
     "faq_user_prompt_template": frozenset({"codigo", "pregunta", "respuesta", "evitar", "productos", "consulta", "perfil"}),
     "producto_linea_template": frozenset({"producto", "uso", "dosis", "documento"}),
+    "inventario_template": frozenset({"tiendas"}),
+    "inventario_alternativas_template": frozenset({"ingredientes", "productos"}),
 }
 
 CAMPOS_CHUNK = tuple(sorted(_PLACEHOLDERS_PERMITIDOS["chunk_template"]))
@@ -153,8 +177,9 @@ def construir_prompt_config(filas: Dict[str, str]) -> PromptConfig:
 
     if valores["llm_max_tokens"] <= 0 or valores["retrieval_top_k"] <= 0:
         raise PromptConfigError("'llm_max_tokens' y 'retrieval_top_k' deben ser mayores que 0")
-    if valores["perfil_max_preguntas"] < 0 or valores["faq_candidatos"] < 0:
-        raise PromptConfigError("'perfil_max_preguntas' y 'faq_candidatos' no pueden ser negativos")
+    if min(valores["perfil_max_preguntas"], valores["faq_candidatos"], valores["inventario_max_tiendas"],
+           valores["inventario_max_productos"]) < 0:
+        raise PromptConfigError("'perfil_max_preguntas', 'faq_candidatos' e 'inventario_max_tiendas' no pueden ser negativos")
 
     return PromptConfig(**valores)
 

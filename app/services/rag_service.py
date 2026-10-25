@@ -16,12 +16,16 @@ from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.consumo_llm import medir_cliente
+from app.services.traza import medido, paso
 from app.services.pii_sanitizer import sanitizar_pii, clasificar_intencion
 from app.services.catalog import resolver_productos_comerciales, construir_carrito_items
 from app.services.prompt_config import cargar_prompt_config, CAMPOS_CHUNK, PromptConfig
 from app.services.perfil_cliente import PerfilUsuario
 from app.services.faq_service import Candidata, elegir_faq, indice_faq
-from app.services.producto_service import cerrar_con_producto, elegir_producto, linea_producto
+from app.services.producto_service import (
+    _clave_nombre, cerrar_con_producto, elegir_producto, linea_producto, nombre_corto_producto, texto_existencias,
+)
 from app.schemas.domain import CarritoItem
 
 from app.services.cache_service import semantic_cache
@@ -52,21 +56,10 @@ REGEX_CULTIVO_EN_CONSULTA = re.compile(
     r'aguacate\w*|pasto\w*|potrero\w*|ganado|vacas?|almácigo\w*|almacigo\w*|vivero\w*|ca[ñn]a)\b',
     re.IGNORECASE,
 )
-# Siglas de formulación que no forman parte del nombre que dice el cliente ("Mancuerna Plus 28 SE").
-_FORMULACIONES = {"sc", "ec", "sl", "wp", "wg", "se", "od", "gr", "gb", "sp", "fs", "ew", "cs", "ft", "tds"}
 TTL_PRODUCTOS_S = 3600
 _NOMBRES_GENERICOS = {"insecticida", "fungicida", "herbicida", "fertilizante", "semilla", "foliar", "abono", "producto"}
 
 
-def _clave_nombre(texto: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", texto.lower())
-
-
-def nombre_corto_producto(producto: str) -> str:
-    """'MANCUERNA PLUS 28 SE' -> 'mancuernaplus'; 'ROOT-PLUS' -> 'rootplus'."""
-    palabras = [w for w in re.split(r"[\s\-_/®™]+", producto or "")
-                if w and not any(ch.isdigit() for ch in w) and w.lower() not in _FORMULACIONES]
-    return _clave_nombre("".join(palabras))
 
 
 def texto_de_busqueda(consulta: str, cultivo: Optional[str], productos: set) -> str:
@@ -122,10 +115,25 @@ class RAGResult(BaseModel):
     componente_fallo: Optional[str] = None
 
 
+def _normalizar_dosis(texto: str) -> str:
+    """
+    Misma cantidad escrita distinto -> mismo texto: '0,3 Lt/Ha' = '0.3 L/ha' = '0.3 litros / ha'.
+    Solo unifica ortografía de unidades, coma decimal y espacios; la cifra y el área no cambian.
+    """
+    t = texto.lower()
+    t = re.sub(r"(?<=\d),(?=\d)", ".", t)
+    for patron, unidad in ((r"\b(?:litros?|lts?)\b", "l"), (r"\b(?:kilos?|kilogramos?|kgs)\b", "kg"),
+                           (r"\b(?:gramos?|grs?)\b", "g"), (r"\b(?:mililitros?|mls)\b", "ml")):
+        t = re.sub(patron, unidad, t)
+    return re.sub(r"\s+", "", t)
+
+
 def validar_groundedness_dosis(respuesta_llm: str, contexto_completo: str) -> bool:
     """
     Groundedness Gate (RSK-001): Rejects LLM generation if any numerical dosage
-    in the response does not appear verbatim in the Qdrant context chunks.
+    in the response does not appear in the Qdrant context chunks. Unit spelling is
+    normalized first (_normalizar_dosis): the sheet says "0.3 Lt/Ha" and the LLM
+    writes "0.3 L/ha" (rejected a correct FAQ answer, 2026-10-24).
     """
     cifras_respuesta = [
         m.group(0).lower().strip() 
@@ -134,9 +142,9 @@ def validar_groundedness_dosis(respuesta_llm: str, contexto_completo: str) -> bo
     if not cifras_respuesta:
         return True
 
-    contexto_norm = contexto_completo.lower()
+    contexto_norm = _normalizar_dosis(contexto_completo)
     for cifra in cifras_respuesta:
-        if cifra not in contexto_norm:
+        if _normalizar_dosis(cifra) not in contexto_norm:
             logger.warning(f"Groundedness breach detected. Hallucinated dosage: '{cifra}'")
             return False
     return True
@@ -188,10 +196,10 @@ class ATVRagService:
 
         # httpx client injected directly to prevent 'proxies' kwarg collisions
         custom_http_client = httpx.AsyncClient()
-        self.llm_client = AsyncOpenAI(
+        self.llm_client = medir_cliente(AsyncOpenAI(
             api_key=settings.openai_api_key,
             http_client=custom_http_client
-        )
+        ))
 
     async def _resolve_vector_name(self) -> Optional[str]:
         """
@@ -242,15 +250,20 @@ class ATVRagService:
 
     async def _buscar_fichas(self, consulta: str, cultivo: Optional[str], top_k: int) -> list:
         """Fichas técnicas más parecidas en Qdrant (consulta + cultivo del perfil si hace falta). Lanza si Qdrant falla."""
-        texto_busqueda = texto_de_busqueda(consulta, cultivo, await self._nombres_productos()) if cultivo else consulta
-        query_vector = list(self.embedding_model.embed([texto_busqueda]))[0].tolist()
-        vector_name = await self._resolve_vector_name()
-        qdrant_query_vector = (
-            NamedVector(name=vector_name, vector=query_vector) if vector_name is not None else query_vector
-        )
-        return list(await self.qdrant.search(
-            collection_name=self.alias_name, query_vector=qdrant_query_vector, limit=top_k
-        ))
+        if cultivo:
+            with paso("Nombres de productos del corpus (caché 1 h)", "qdrant"):
+                nombres = await self._nombres_productos()
+        texto_busqueda = texto_de_busqueda(consulta, cultivo, nombres) if cultivo else consulta
+        with paso("Embedding de la consulta (fichas)", "embedding"):
+            query_vector = list(self.embedding_model.embed([texto_busqueda]))[0].tolist()
+        with paso("Búsqueda de fichas en Qdrant", "qdrant"):
+            vector_name = await self._resolve_vector_name()
+            qdrant_query_vector = (
+                NamedVector(name=vector_name, vector=query_vector) if vector_name is not None else query_vector
+            )
+            return list(await self.qdrant.search(
+                collection_name=self.alias_name, query_vector=qdrant_query_vector, limit=top_k
+            ))
 
     async def _generar(self, user_prompt: str, cfg: PromptConfig) -> tuple:
         """(texto, tokens_entrada, tokens_salida) de la generación. Lanza si el LLM falla."""
@@ -267,6 +280,13 @@ class ATVRagService:
         usage = response.usage
         return (response.choices[0].message.content.strip(),
                 usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)
+
+    async def _linea_cierre(self, ficha: Optional[Dict[str, Any]], cfg: PromptConfig, sucursal_id: Optional[int]) -> str:
+        """Línea del producto recomendado + sus existencias por tienda (producto_service.py)."""
+        linea = linea_producto(ficha, cfg)
+        with paso("Inventario y productos con el mismo ingrediente", "postgres"):
+            existencias = await texto_existencias(self.db, ficha, cfg, sucursal_id)
+        return f"{linea} {existencias}" if existencias else linea
 
     async def _en_alcance(self, consulta_sanitizada: str, cfg: PromptConfig) -> bool:
         """True if the query is about agriculture or Aldea Global. Fails open (True) on any error."""
@@ -298,6 +318,7 @@ class ATVRagService:
         lat_sanitizacion: int,
         lat_clasif: int,
         lat_faq: int,
+        sucursal_id: Optional[int] = None,
     ) -> RAGResult:
         """
         Responde con la respuesta aprobada de la pregunta frecuente, adaptada por el LLM
@@ -338,8 +359,9 @@ class ATVRagService:
         tokens_in = tokens_out = 0
         # El producto lo elige una llamada aparte, en paralelo (producto_service.py).
         generacion, ficha_producto = await asyncio.gather(
-            self._generar(user_prompt, cfg),
-            elegir_producto(self.llm_client, cfg, consulta_sanitizada, cultivo, fichas),
+            medido("Generación de la respuesta (FAQ + fichas)", "llm", self._generar(user_prompt, cfg)),
+            medido("Selector de producto", "llm",
+                   elegir_producto(self.llm_client, cfg, consulta_sanitizada, cultivo, fichas)),
             return_exceptions=True,
         )
         if isinstance(ficha_producto, BaseException):
@@ -350,17 +372,18 @@ class ATVRagService:
             respuesta_texto, tokens_in, tokens_out = generacion
 
         aprobada = f"{f.respuesta}\n\n[Fuente: {fuente}]"
+        with paso("Control de dosis (groundedness)", "cpu"):
+            rechazada = respuesta_texto is not None and (REGEX_ABSTENCION.search(respuesta_texto) or not validar_groundedness_dosis(
+                respuesta_texto, f"{f.respuesta} {f.respuesta_evitar or ''} {productos}"))
         if respuesta_texto is None:
             respuesta_texto, modelo = aprobada, "faq_literal"
-        elif REGEX_ABSTENCION.search(respuesta_texto) or not validar_groundedness_dosis(
-            respuesta_texto, f"{f.respuesta} {f.respuesta_evitar or ''} {productos}"
-        ):
+        elif rechazada:
             motivo = "abstención" if REGEX_ABSTENCION.search(respuesta_texto) else "dosis no respaldada"
             logger.warning(f"FAQ generation rejected for {f.codigo} ({motivo}), serving approved answer")
             respuesta_texto, modelo = aprobada, "faq_literal"
 
         # La FAQ siempre cierra con producto: el de la ficha elegida o el mensaje de la tienda.
-        respuesta_texto = cerrar_con_producto(respuesta_texto, linea_producto(ficha_producto, cfg))
+        respuesta_texto = cerrar_con_producto(respuesta_texto, await self._linea_cierre(ficha_producto, cfg, sucursal_id))
         if ficha_producto:
             registros.append({"tipo": "producto_recomendado", "producto": ficha_producto.get("producto"),
                               "documento_fuente": ficha_producto.get("documento_fuente")})
@@ -399,10 +422,11 @@ class ATVRagService:
         cultivo_principal = perfil.cultivo_principal() if perfil else None
 
         # Phase 1: PII Sanitization (Ley 787 Compliance)
-        consulta_sanitizada, lat_sanitizacion = sanitizar_pii(consulta_raw)
-        
-        # Phase 2: Intent Classification
-        intencion, lat_clasif = clasificar_intencion(consulta_sanitizada)
+        with paso("Sanitización PII y clasificación de intención", "cpu"):
+            consulta_sanitizada, lat_sanitizacion = sanitizar_pii(consulta_raw)
+
+            # Phase 2: Intent Classification
+            intencion, lat_clasif = clasificar_intencion(consulta_sanitizada)
 
         # Phase 2.1: Preguntas frecuentes (atv.pregunta_frecuente) = punto de partida.
         # Candidatas por embedding; el juez LLM corre en paralelo con el scope gate.
@@ -410,8 +434,10 @@ class ATVRagService:
         candidatas: List[Candidata] = []
         if cfg.faq_candidatos > 0:
             try:
-                await indice_faq.sincronizar(self.db, self.embedding_model)
-                candidatas = indice_faq.candidatas(self.embedding_model, consulta_sanitizada, cfg.faq_candidatos)
+                with paso("Índice de preguntas frecuentes (sincronizar)", "postgres"):
+                    await indice_faq.sincronizar(self.db, self.embedding_model)
+                with paso("Candidatas de preguntas frecuentes (embedding)", "embedding"):
+                    candidatas = indice_faq.candidatas(self.embedding_model, consulta_sanitizada, cfg.faq_candidatos)
             except Exception as exc:
                 # Sin preguntas frecuentes se sigue con las fichas: no tumba la consulta.
                 logger.error(f"FAQ index unavailable ({type(exc).__name__}): {exc}")
@@ -423,8 +449,9 @@ class ATVRagService:
         # refused agronomic questions whose retrieved context did not match).
         t_alcance = time.perf_counter()
         en_alcance, faq = await asyncio.gather(
-            self._en_alcance(consulta_sanitizada, cfg),
-            elegir_faq(self.llm_client, cfg, consulta_sanitizada, cultivo_principal, candidatas),
+            medido("Filtro de alcance", "llm", self._en_alcance(consulta_sanitizada, cfg)),
+            medido("Juez de preguntas frecuentes", "llm",
+                   elegir_faq(self.llm_client, cfg, consulta_sanitizada, cultivo_principal, candidatas)),
         )
         lat_clasif += int((time.perf_counter() - t_alcance) * 1000)
         # Una pregunta frecuente es del alcance por definición, aunque el gate dude.
@@ -444,6 +471,7 @@ class ATVRagService:
             return await self._responder_faq(
                 faq, consulta_sanitizada, intencion, perfil_texto, cultivo_principal, cfg,
                 lat_sanitizacion=lat_sanitizacion, lat_clasif=lat_clasif, lat_faq=lat_faq,
+                sucursal_id=sucursal_id or (perfil.sucursal_id if perfil else None),
             )
 
         # =================================================================
@@ -465,7 +493,8 @@ class ATVRagService:
 
         if intencion == "informativa":
             t_cache = time.perf_counter()
-            cached_data = await semantic_cache.get_cached_response(clave_cache, version_corpus_actual)
+            with paso("Caché semántica (leer)", "redis"):
+                cached_data = await semantic_cache.get_cached_response(clave_cache, version_corpus_actual)
             
             if cached_data:
                 lat_cache = int((time.perf_counter() - t_cache) * 1000)
@@ -561,8 +590,9 @@ class ATVRagService:
         # Phase 6: Asynchronous LLM Generation (+ product selector in parallel, producto_service.py)
         t_llm = time.perf_counter()
         generacion, ficha_producto = await asyncio.gather(
-            self._generar(user_prompt, cfg),
-            elegir_producto(self.llm_client, cfg, consulta_sanitizada, cultivo_principal, metadata_list),
+            medido("Generación de la respuesta (fichas)", "llm", self._generar(user_prompt, cfg)),
+            medido("Selector de producto", "llm",
+                   elegir_producto(self.llm_client, cfg, consulta_sanitizada, cultivo_principal, metadata_list)),
             return_exceptions=True,
         )
         if isinstance(ficha_producto, BaseException):
@@ -593,7 +623,10 @@ class ATVRagService:
         lat_llm = int((time.perf_counter() - t_llm) * 1000)
 
         # Phase 7: Groundedness & Abstention Gates
-        if REGEX_ABSTENCION.search(respuesta_texto):
+        with paso("Control de dosis (groundedness)", "cpu"):
+            abstencion = bool(REGEX_ABSTENCION.search(respuesta_texto))
+            respaldada = abstencion or validar_groundedness_dosis(respuesta_texto, contexto_completo)
+        if abstencion:
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
                 respuesta=respuesta_texto,
@@ -611,7 +644,7 @@ class ATVRagService:
                 lat_llm_ms=lat_llm
             )
 
-        if not validar_groundedness_dosis(respuesta_texto, contexto_completo):
+        if not respaldada:
             return RAGResult(
                 consulta_sanitizada=consulta_sanitizada,
                 respuesta=cfg.msg_groundedness_rechazo,
@@ -632,18 +665,22 @@ class ATVRagService:
             )
 
         # Phase 7.5: cierre con producto de AldeaZON (no tras abstención ni rechazo: ya retornaron)
-        respuesta_texto = cerrar_con_producto(respuesta_texto, linea_producto(ficha_producto, cfg))
+        sucursal_cliente = sucursal_id or (perfil.sucursal_id if perfil else None)
+        respuesta_texto = cerrar_con_producto(
+            respuesta_texto, await self._linea_cierre(ficha_producto, cfg, sucursal_cliente)
+        )
 
         # Phase 8: Commercial Sales Resolution (RSK-NEW-04)
         # If the technical query passed all gates and is a recommendation, resolve the cart payload.
         carrito = []
         sucursal_carrito = sucursal_id or (perfil.sucursal_id if perfil else None)
         if intencion == "recomendacion" and principio_activo_top1 and sucursal_carrito:
-            productos_comerciales = await resolver_productos_comerciales(
-                session=self.db,
-                principio_activo=principio_activo_top1,
-                sucursal_id=sucursal_carrito
-            )
+            with paso("Catálogo comercial (carrito)", "postgres"):
+                productos_comerciales = await resolver_productos_comerciales(
+                    session=self.db,
+                    principio_activo=principio_activo_top1,
+                    sucursal_id=sucursal_carrito
+                )
             # Precio de asociado solo para socios activos identificados; sin perfil
             # (llamada directa de la tienda) se mantiene el comportamiento anterior.
             carrito = construir_carrito_items(
@@ -655,16 +692,17 @@ class ATVRagService:
         # NEW: Phase 9: Cache the Final Result
         # =================================================================
         if intencion == "informativa":
-            await semantic_cache.set_cached_response(
-                consulta_sanitizada=clave_cache,
-                version_corpus=version_corpus_actual,
-                response_payload={
-                    "respuesta": respuesta_texto,
-                    "fuente": fuente_formateada,
-                    "confianza": max_score,
-                    "registros_usados": metadata_list
-                }
-            )
+            with paso("Caché semántica (guardar)", "redis"):
+                await semantic_cache.set_cached_response(
+                    consulta_sanitizada=clave_cache,
+                    version_corpus=version_corpus_actual,
+                    response_payload={
+                        "respuesta": respuesta_texto,
+                        "fuente": fuente_formateada,
+                        "confianza": max_score,
+                        "registros_usados": metadata_list
+                    }
+                )
 
         return RAGResult(
             consulta_sanitizada=consulta_sanitizada,

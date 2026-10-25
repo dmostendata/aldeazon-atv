@@ -15,10 +15,12 @@ from app.models.traceability import Consulta, ErrorLog
 from app.services.rag_service import ATVRagService
 from app.services.prompt_config import PromptConfigError, cargar_prompt_config
 from app.services.faq_service import indice_faq
+from app.services.consumo_llm import iniciar_consumo
+from app.services.traza import iniciar_traza, paso
 from app.services.perfilamiento import (
     ETAPA_PERFILAMIENTO, ETAPA_RESPUESTA, ExtractorPerfil, Perfilador, nueva_sesion_id,
 )
-from app.schemas.domain import ChatResponse
+from app.schemas.domain import ChatResponse, ContextoInicial
 from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel, Field
 
@@ -51,6 +53,9 @@ class ChatRequest(BaseModel):
         None, max_length=64,
         description="Sesión de la conversación. Vacío = sesión nueva; la respuesta trae el id a reenviar.",
     )
+    contexto: ContextoInicial | None = Field(
+        None, description="Perfil ya estructurado (formulario inicial): reemplaza la extracción con LLM de ese turno",
+    )
 
 logger.info("Pre-loading bge-m3 dense embedding model into RAM (Singleton)...")
 embedding_model_singleton = TextEmbedding("intfloat/multilingual-e5-large")
@@ -76,6 +81,8 @@ async def procesar_consulta_interna(
     Strictly enforced to complete within the 10,000ms SLA.
     """
     start_time = time.perf_counter()
+    consumo = iniciar_consumo()
+    traza = iniciar_traza()
     sesion_id = request.sesion_id or nueva_sesion_id()
 
     # 1. Inject connections into the RAG Orchestrator
@@ -86,13 +93,15 @@ async def procesar_consulta_interna(
     )
     try:
         # atv.prompt_config is the single source of truth: no hardcoded fallback.
-        cfg = await cargar_prompt_config(db)
+        with paso("Configuración de prompts", "postgres"):
+            cfg = await cargar_prompt_config(db)
 
         # 2. Perfilamiento: antes de recomendar, el ATV pregunta quién es y cómo es su finca.
         perfilador = Perfilador(db, ExtractorPerfil(rag_service.llm_client), settings.semillero_hash_salt)
-        turno = await perfilador.procesar_turno(sesion_id, request.consulta, cfg)
+        turno = await perfilador.procesar_turno(sesion_id, request.consulta, cfg, contexto=request.contexto)
         if turno.etapa == ETAPA_PERFILAMIENTO:
-            await db.commit()
+            with paso("Sesión de la conversación (guardar)", "postgres"):
+                await db.commit()
             return ChatResponse(
                 respuesta=turno.respuesta,
                 escalada_hitl=False,
@@ -101,11 +110,14 @@ async def procesar_consulta_interna(
                 sesion_id=sesion_id,
                 etapa=ETAPA_PERFILAMIENTO,
                 perfil=turno.perfil.resumen_publico(),
+                consumo_llm=consumo.resumen(),
+                latencia_pasos=traza.resumen(),
             )
 
         # El estado de la sesión se guarda antes del RAG: un fallo del catálogo
         # dentro de la misma transacción no debe hacer perder el perfil.
-        await db.commit()
+        with paso("Sesión de la conversación (guardar)", "postgres"):
+            await db.commit()
         result = await rag_service.procesar_consulta(
             turno.consulta_para_rag, request.sucursal_id, perfil=turno.perfil, cfg=cfg
         )
@@ -163,7 +175,8 @@ async def procesar_consulta_interna(
         )
         db.add(err_runtime)
 
-    await db.commit()
+    with paso("Registro de trazabilidad (atv.consulta)", "postgres"):
+        await db.commit()
     
     return ChatResponse(
         respuesta=f"{turno.aviso}\n\n{result.respuesta}" if turno.aviso else result.respuesta,
@@ -174,6 +187,8 @@ async def procesar_consulta_interna(
         sesion_id=sesion_id,
         etapa=ETAPA_RESPUESTA,
         perfil=turno.perfil.resumen_publico(),
+        consumo_llm=consumo.resumen(),
+        latencia_pasos=traza.resumen(),
     )
 
 

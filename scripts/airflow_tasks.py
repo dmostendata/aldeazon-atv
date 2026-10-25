@@ -78,7 +78,7 @@ async def task_construir_y_promover():
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python -m scripts.airflow_tasks [sincronizar_s3|obtener_pendientes|extraer_pdf|validar_hitl|construir_y_promover|construir_perfiles|reiniciar_cargas]")
+        print("Uso: python -m scripts.airflow_tasks [sincronizar_s3|obtener_pendientes|extraer_pdf|validar_hitl|construir_y_promover|construir_perfiles|construir_inventario|reiniciar_cargas]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -99,6 +99,9 @@ def main():
     elif cmd == "construir_perfiles":
         from scripts.construir_perfiles import construir_perfiles
         print(json.dumps(asyncio.run(construir_perfiles())))
+    elif cmd == "construir_inventario":
+        from scripts.construir_inventario import construir_inventario
+        print(json.dumps(asyncio.run(construir_inventario())))
     elif cmd == "reiniciar_cargas":
         from scripts.reset_inventory import ejecutar_reinicio_completo
         ejecutar_reinicio_completo(confirm=True, delete_db=True)

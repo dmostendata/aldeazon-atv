@@ -818,23 +818,36 @@ flowchart TD
 
 ### 11.4. Perfilamiento (`app/services/perfilamiento.py`, `app/services/perfil_cliente.py`)
 
-**Orden de preguntas** (cada dato se pregunta **una sola vez**; como máximo `perfil_max_preguntas` = 4 preguntas, después responde con lo que haya):
+**Regla estricta: todo de una vez** (migración `014_perfil_todo_de_una_vez.sql`). Para no gastar un turno, ni una llamada al LLM, por dato, el agente pide en **un solo mensaje** todo lo que necesita para analizar el caso. Lo que falte lo pide **junto, una sola vez**, y después responde con lo que haya. `perfil_max_preguntas` (4) queda como tope de turnos.
 
-| Turno | Pregunta | Clave en `atv.prompt_config` | Se omite si… |
+| Turno | Qué pide | Clave en `atv.prompt_config` | Se omite si… |
 | --- | --- | --- | --- |
-| 1 (sesión nueva) | ¿Es socio/cliente de Aldea Global? Cédula + WhatsApp. Si no, ¿a qué se dedica? | `perfil_msg_bienvenida` | el primer mensaje ya identifica a un socio |
-| — | Pide el WhatsApp si solo escribió la cédula | `perfil_msg_pedir_telefono` | — |
-| si falta | Cultivos y manzanas | `perfil_msg_pedir_cultivo` | el registro trae rubros |
-| si falta | Municipio o departamento | `perfil_msg_pedir_ubicacion` | el registro trae zona |
-| opcional | Etapa del cultivo y terreno (plano/quebrado, suelo, altura) | `perfil_msg_pedir_terreno` | tiene finca registrada, es comerciante o técnico, o ya lo dijo |
-| fin | Responde la consulta técnica hecha en el camino; si no hubo, pide la consulta | `perfil_msg_completo` | — |
+| 1 (sesión nueva) | **Socio/cliente:** cédula + WhatsApp + su consulta. **Si no:** a qué se dedica, cultivo y manzanas, municipio y comunidad, etapa, terreno y el problema (qué le ve a la planta, desde cuándo, qué ha aplicado) | `perfil_msg_bienvenida` | el primer mensaje ya identifica a un socio |
+| — | El WhatsApp (y la consulta), si solo escribió la cédula | `perfil_msg_pedir_telefono` | — |
+| 2, una sola vez | **Todo lo que falte, en un mensaje**: una línea por dato dentro de `perfil_msg_pedir_faltantes` (`{preguntas}`). Con un solo dato faltante va directo su pregunta | `perfil_msg_pedir_faltantes` + `perfil_msg_pedir_cultivo`, `_ubicacion`, `_terreno`, `_consulta` | el dato ya se dio, viene del registro o ya se pidió |
+| 2 (dijo ser socio sin cédula) | Solo cédula + WhatsApp y la consulta: cultivos y finca salen del registro | `perfil_msg_pedir_identificacion` (+ `_consulta`) | — |
+| fin | Responde la consulta; si nunca la dio, la pide | `perfil_msg_completo` | — |
+
+**Perfil estructurado (`contexto`).** Un formulario puede mandar el perfil ya estructurado en el campo opcional `contexto` de `POST /api/v1/consultar` (`ContextoInicial`, en `app/schemas/domain.py`), con `consulta` como la pregunta o el problema. Ese turno no llama al LLM de extracción: se ahorran unos 550 tokens y una llamada.
+
+```json
+{"consulta": "Mosca blanca en el envés desde hace 2 semanas. No he aplicado nada.",
+ "contexto": {"tipo_usuario": "productor", "cultivos": [{"nombre": "Tomate", "area": 3, "unidad": "mz"}],
+              "municipio": "Sébaco", "comunidad": "Chagüitillo", "etapa_cultivo": "Floración", "topografia": "Plano"}}
+```
+
+Para un socio basta `{"tipo_usuario": "socio", "cedula": "...", "telefono": "..."}`. La cédula y el teléfono se hashean enseguida, igual que en el texto. Los campos libres pasan por el enmascarado de cédulas y teléfonos. Campos desconocidos: HTTP 422.
+
+Cultivo y terreno no se piden a comerciantes ni a técnicos. Los mensajes que no traen datos de perfil (un saludo, o solo cédula y teléfono) **no pasan por el LLM de extracción** (`sin_datos_de_perfil`).
+
+Medido el 2026-10-24: un socio llega a la respuesta en **2 mensajes** («Hola» → cédula + WhatsApp + pregunta), y un no cliente que responde por partes, en 3. Antes eran hasta 6 mensajes y 5 llamadas de extracción.
 
 **Identificación de socios y clientes**
 
 * La cédula (`001-010190-0000A`, con o sin guiones) y el teléfono (8 dígitos, acepta `+505`, guiones y espacios) se leen del **texto crudo** y se convierten de inmediato en **HMAC-SHA256 con el salt de Semillero** (`SEMILLERO_HASH_SALT`), igual que `core/masking.py` de Semillero. Se prueban las variantes de formato con que la cédula puede estar en el origen (mayúscula/minúscula, con/sin guiones).
 * Se exige **cédula y teléfono**: solo con la cédula nadie puede ver la finca de otra persona. Máximo **3 intentos** por sesión (frena la enumeración de cédulas).
 * Si coinciden, el perfil sale del registro (`fuente = registro`, `verificado = true`) y el agente confirma: *"Gracias, encontré su registro. Tengo esta información: socio activo de Aldea Global; 1 finca(s) registrada(s); en San Rafael del Norte, Jinotega."* (`perfil_msg_verificado`, placeholder `{resumen}`).
-* Si no coinciden o no hay salt: `perfil_msg_no_encontrado` y sigue con preguntas.
+* Si no coinciden o no hay salt: `perfil_msg_no_encontrado` y, en el mismo mensaje, todo lo que falte del caso.
 * La sesión guarda los hashes de la cédula solo mientras espera el teléfono; después los borra.
 
 **Lo que dice el usuario.** Cada mensaje (ya sanitizado) pasa por un LLM con `perfil_extraccion_prompt` que devuelve JSON: `tipo_usuario` (`socio`, `cliente`, `productor`, `comerciante`, `tecnico`, `otro`), `cultivos` (nombre, área, unidad `mz`/`ha`; las hectáreas se convierten a manzanas: 1 mz = 0,7026 ha), `municipio`, `departamento`, `etapa_cultivo`, `topografia`, `tipo_suelo`, `altura_msnm`, `tipo_negocio` y `consulta_tecnica` (la pregunta agronómica, que queda pendiente hasta completar el perfil). Lo declarado nunca pisa lo del registro. Si el LLM falla, el turno sigue y se vuelve a preguntar.
@@ -860,14 +873,14 @@ Hasta 3 fincas y 5 lotes por finca. Nunca incluye nombres, cédula, teléfonos, 
 | 2 | Intención | Regex de riesgo (`dosis`, `qué producto`, `aplicar`, `l/ha`…) → `recomendacion`; si no, `informativa` | — |
 | 3a | **Preguntas frecuentes: candidatas** | Las `faq_candidatos` (5) preguntas de `atv.pregunta_frecuente` más parecidas a la consulta (embedding de la pregunta y sus variantes, en memoria) | Tabla no disponible → sigue sin FAQ |
 | 3b | **Filtro de alcance** ∥ **juez FAQ** | Dos llamadas en paralelo: `alcance_prompt` → `{"en_alcance": bool}` y `faq_juez_prompt` → `{"codigo": "FAQ-xxx" \| null}` (¿pregunta **lo mismo** que una candidata, con cultivo compatible?) | Fuera de alcance y sin FAQ → `msg_fuera_alcance`. El filtro falla → **deja pasar**; el juez falla → **sin FAQ** (fichas) |
-| 3c | **Respuesta de la FAQ** | Si el juez eligió una: busca también las fichas (para el producto) y genera con `system_prompt` + `faq_user_prompt_template` (respuesta aprobada, lo que hay que evitar, `{productos}`); el **selector de producto** corre en paralelo (ver fase 7.5). Fuente `Preguntas frecuentes de Asistencia Técnica, FAQ-xxx`; no escala, sin carrito, **termina aquí** | LLM caído, abstención o dosis que no está en la respuesta aprobada → se entrega la **respuesta aprobada literal** (`modelo = faq_literal`) |
+| 3c | **Respuesta de la FAQ** | Si el juez eligió una: busca **siempre** las fichas técnicas y genera dos párrafos: la respuesta aprobada y su ampliación con las fichas del mismo problema y cultivo (dosis, intervalo, carencia, tal como en la ficha). Genera con `system_prompt` + `faq_user_prompt_template` (respuesta aprobada, lo que hay que evitar, `{productos}`); el **selector de producto** corre en paralelo (ver fase 7.5). Fuente `Preguntas frecuentes de Asistencia Técnica, FAQ-xxx`; no escala, sin carrito, **termina aquí** | LLM caído, abstención o dosis que no está en la respuesta aprobada → se entrega la **respuesta aprobada literal** (`modelo = faq_literal`) |
 | 4 | Caché Redis | Solo consultas `informativa`. Clave = consulta + perfil + **huella de los prompts** (editar `prompt_config` invalida lo cacheado). TTL 7 días | — |
 | 5 | Búsqueda Qdrant | Embedding `multilingual-e5-large` de la consulta **+ cultivo principal del perfil**; `retrieval_top_k` fichas | Error → `msg_retrieval_error`, escala |
 | 6 | Umbral de confianza | Score ≥ **0,70** (recomendación) / **0,55** (informativa) | Por debajo → `msg_baja_confianza`, escala sin llamar al LLM |
 | 7 | Generación | `system_prompt` + `user_prompt_template` (`{contexto}`, `{consulta}`, `{perfil}`), `llm_modelo`, timeout 6 s | Error → `msg_llm_error`, escala |
 | 8 | Abstención | Si la respuesta dice *"No tengo esa información en las fichas vigentes…"* → escala a Asistencia Técnica | — |
 | 9 | Groundedness | Toda dosis de la respuesta (`x L/ha`, `kg/mz`…) debe estar **literal** en las fichas recuperadas | Dosis inventada → `msg_groundedness_rechazo`, escala |
-| 7.5 | **Producto AldeaZON** (`producto_service.py`) | En paralelo con la generación, `producto_selector_prompt` elige entre las fichas recuperadas la del **mismo problema y cultivo** (para plagas/enfermedades/malezas el uso de la ficha tiene que nombrar el problema; el tipo debe corresponder) → JSON `{"indice": n\|null}`. El **código** arma la línea `producto_linea_template` con producto, uso y dosis literal de la ficha, o `msg_producto_tienda` si ninguna sirve, y la pone antes de la fuente (si el LLM escribió una, se quita). También en la FAQ y en su respuesta literal | Abstención, rechazo o error: sin línea. Selector caído → mensaje de la tienda |
+| 7.5 | **Producto AldeaZON** (`producto_service.py`) | En paralelo con la generación, `producto_selector_prompt` elige entre las fichas recuperadas la del **mismo problema y cultivo** (para plagas/enfermedades/malezas el uso de la ficha tiene que nombrar el problema; el tipo debe corresponder) → JSON `{"indice": n\|null}`. El **código** arma la línea `producto_linea_template` con producto, uso y dosis literal de la ficha, o `msg_producto_tienda` si ninguna sirve, y la pone antes de la fuente (si el LLM escribió una, se quita). Le suma las **existencias** del producto en `atv.inventario_producto` (`inventario_template`: tiendas con stock, primero la sucursal del cliente, hasta `inventario_max_tiendas`; `msg_sin_existencias` si no hay en ninguna; nada si el inventario aún no está cargado). El cruce ficha ↔ inventario es por nombre normalizado (`nombre_corto_producto`: "EVITO T" = "Evito T 450 SC"; "ALDEAZON NPK PLUS+" contiene "NPK Plus"). Además toma el **ingrediente activo de la ficha** ("Fluoxastrobin + Tebuconazole") y lista hasta `inventario_max_productos` productos de la tabla de productos de AldeaZON que lo contienen, con sus existencias (`inventario_alternativas_template`). El cruce de ingredientes normaliza la ortografía inglés/español (`clave_ingrediente`: Chlorothalonil = Clorotalonil, Cymoxanil = Cimoxanilo). Solo el 54 % de los productos activos tiene ingrediente cargado en Aldea (`stc2.agroquimico_ingrediente_activo`; Evito T, por ejemplo, no). También en la FAQ y en su respuesta literal | Abstención, rechazo o error: sin línea. Selector caído → mensaje de la tienda |
 | 10 | Carrito | Solo `recomendacion` con sucursal: productos con el ingrediente activo de la ficha top-1, `estado = 1`, stock > 0, del más barato al más caro. **Precio de asociado solo para socios activos verificados** | Error de catálogo → carrito vacío (la respuesta técnica sale igual) |
 | 11 | Guardar en caché | Solo `informativa` | — |
 
@@ -921,6 +934,7 @@ El registro en el catálogo está en `scripts/semillero/004_cafe_perfil_finca.sq
 | `atv.perfil_finca` | Fincas activas: altura, pendiente, topografía, suelo, áreas, municipio/departamento | DAG | API |
 | `atv.perfil_lote` | Lotes activos: área, variedad, etapa, siembra, densidad, rendimiento esperado | DAG | API |
 | `atv.pregunta_frecuente` | Preguntas frecuentes de Asistencia Técnica (`scripts/005_create_pregunta_frecuente.sql`): `codigo`, cultivo, categoría, pregunta, `variantes[]`, respuesta aprobada, `respuesta_evitar`, `activo` | `scripts/cargar_preguntas_frecuentes.py` (desde el Excel) | API (embeddings en memoria; se recalculan solos al cambiar la tabla) |
+| `atv.inventario_producto` | Existencias por producto y tienda (`scripts/011_create_inventario.sql`): producto, `nombre_clave`, tienda, sucursal, unidad, clasificación, cantidad disponible, `fecha_foto`. Misma lógica que la vista `stc2.vw_az_productos_inventario_ia` (solo existe en develop), sin bodegas internacionales ni "Producto Vencido" | DAG (`scripts/construir_inventario.py`, desde `stg_insumos` + `stg_credito.cre_catalogo_unidad_medida`) | API |
 | `atv.sesion_perfil` | Estado por sesión: `estado` (`perfilando`/`completo`), `perfil` (JSON), preguntas hechas, intentos de identificación, consulta pendiente (sanitizada) | API | API |
 
 La primera carga (2026-10-15) dejó 39.887 personas (22.565 socios activos), 6.304 fincas y 1.835 lotes.
@@ -968,11 +982,14 @@ Orden usado en producción (2026-10-15 / 17):
 2. **PostgreSQL 10.0.0.14:** regla `pg_hba.conf` para VPS4 → base `semillero` y `GRANT SELECT` de las 12 tablas al rol del ATV (instrucciones para el admin: `docs/instrucciones_admin_vps2_perfil_atv.pdf`).
 3. **ATV:** `scripts/003_create_perfil.sql` y `scripts/004_prompt_vendedor.sql` sobre `staging` **y reinicio inmediato** de `aldeazon-atv.service` (el código y las claves nuevas van juntos: el código viejo no conoce `{perfil}` y el nuevo exige las claves nuevas).
 4. **Carga inicial** (`construir_perfiles`) y publicación del DAG en VPS2.
+5b. **Inventario:** catálogos Semillero `scripts/semillero/005_insumos_inventario.sql` y `006_insumos_ingredientes.sql` (proyecto `insumos`, módulo `inventario`, 6 tablas de `stc2`; las unidades salen del catálogo de crédito) → `semillero_preparar_destino` (previsualizar / aplicar) → despausar `semillero_ingesta_insumos_inventario_01` → `GRANT SELECT` al rol del ATV (sección 4 del catálogo) → `scripts/011_create_inventario.sql` y `012_ingredientes_y_ficha.sql` → DAG `atv_perfil_productor` (tarea `construir_inventario`, 01:30). Las existencias tienen la frescura de la carga nocturna de Semillero (20:00).
 5. **Preguntas frecuentes:** `scripts/005_create_pregunta_frecuente.sql` sobre `staging` → `python -m scripts.cargar_preguntas_frecuentes "docs/Preguntas_y_Respuestas_AldeaZON rellenado.xlsx"` (primero con `--dry-run`) → reinicio de la API (código nuevo). Para **actualizar** la lista basta volver a correr el script con el Excel nuevo: hace upsert por ID, desactiva los IDs que ya no vienen y la API recalcula los embeddings en la siguiente consulta, sin reinicio. Se niega a cargar si el Excel trae menos de la mitad de las preguntas activas.
 
 6. **Corpus de fichas v2 (extracción por ficha):** `python -m scripts.reindexar_corpus construir --version 2` llena `atv_corpus_v2` sin tocar el alias (la API sigue en v1); `probar --version 2 "consulta" ...` compara v1 y v2; `promover --version 2` actualiza `atv.inventario_archivo`, mueve el alias `atv_corpus` → `atv_corpus_v2` y vacía Redis. v1 no se borra: volver atrás = `promover --version 1`. Reporte por archivo en `fixtures/reindex_v2.json`. El build carga su propia copia de e5 (~2,1–2,4 GB de RSS): correrlo con la API ya liberada de la copia duplicada del modelo (`cache_service.py` ahora la carga solo si se usa) y vigilando la RAM.
 
 **Extracción por ficha** (`app/services/extractor_ficha.py`, desde v2; la ingesta diaria la usa cuando el alias apunta a v2 o más, ver `ingest_seaweedfs.version_vigente`): texto del PDF (o transcripción por visión si casi no tiene texto) → una llamada al LLM que devuelve producto, tipo, descripción, precauciones y todos los usos (cultivo, objetivo, dosis, condiciones) → **anclaje**: cada cifra de una dosis debe estar en la ficha y su unidad (`L/ha`, `ml`...) también; si no, la dosis se descarta y el uso queda sin cifra → un registro por uso + uno general por ficha. Las dosis sin unidad de área (por litro, bomba, planta) van a `condiciones` (`RegistroAtomico.dosis` sigue exigiendo /ha o /mz). Resultado al 2026-10-17: 141/142 fichas con registros, 962 registros (v1: 68 fichas, 152), 478 con dosis por ha/mz, 138 productos.
+
+**Socios de prueba:** `python -m scripts.sembrar_perfiles_prueba` crea 5 socios ficticios (ids negativos, cédulas `999-…`, WhatsApp `5555-000N`, hash con `SEMILLERO_HASH_SALT`) para probar la identificación sin datos de personas reales; `--borrar` los quita. La reconstrucción nocturna (`construir_perfiles`) solo reemplaza ids positivos, así que se conservan.
 
 Comprobaciones útiles:
 

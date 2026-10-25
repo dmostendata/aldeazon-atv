@@ -189,7 +189,7 @@ async def construir_perfiles(hoy: date | None = None) -> Dict[str, int]:
     lotes = [l for l in lotes if l["finca_id"] in ids_finca]
 
     async with AsyncSessionLocal() as db:
-        filas_vigentes = (await db.execute(text("SELECT count(*) FROM atv.perfil_productor"))).scalar()
+        filas_vigentes = (await db.execute(text("SELECT count(*) FROM atv.perfil_productor WHERE persona_id > 0"))).scalar()
         if filas_vigentes and len(productores) < filas_vigentes * MIN_PROPORCION_FILAS:
             raise FotoInvalidaError(
                 f"perfil_productor bajaría de {filas_vigentes} a {len(productores)} filas "
@@ -198,9 +198,11 @@ async def construir_perfiles(hoy: date | None = None) -> Dict[str, int]:
 
         # Una sola transacción: la API sigue leyendo los perfiles vigentes
         # (DELETE, no TRUNCATE: no bloquea lecturas) hasta el COMMIT.
-        await db.execute(text("DELETE FROM atv.perfil_lote"))
-        await db.execute(text("DELETE FROM atv.perfil_finca"))
-        await db.execute(text("DELETE FROM atv.perfil_productor"))
+        # Los ids negativos son los socios de prueba (scripts/sembrar_perfiles_prueba.py):
+        # no vienen de Semillero y se conservan.
+        await db.execute(text("DELETE FROM atv.perfil_lote WHERE lote_id > 0"))
+        await db.execute(text("DELETE FROM atv.perfil_finca WHERE finca_id > 0"))
+        await db.execute(text("DELETE FROM atv.perfil_productor WHERE persona_id > 0"))
         if productores:
             await db.execute(text(INSERT_PRODUCTOR), productores)
         if fincas:

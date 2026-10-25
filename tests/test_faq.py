@@ -90,6 +90,7 @@ FICHA_OPERA = {"documento_fuente": "FT Opera.pdf", "producto": "OPERA", "cultivo
 def _servicio(llm, fichas=(FICHA_OPERA,), error_qdrant=None):
     servicio = ATVRagService.__new__(ATVRagService)
     servicio.llm_client = llm
+    servicio.db = None  # sin producto elegido no se consulta el inventario
     servicio._buscar_fichas = AsyncMock(
         side_effect=error_qdrant, return_value=[SimpleNamespace(payload=f) for f in fichas]
     )
@@ -162,3 +163,13 @@ def test_texto_de_busqueda_suma_el_cultivo_solo_si_hace_falta():
     assert texto_de_busqueda("mosca blanca en tomate", "café", productos) == "mosca blanca en tomate"
     assert texto_de_busqueda("¿Cuánto Root Plus le echo?", "café", productos) == "¿Cuánto Root Plus le echo?"
     assert texto_de_busqueda("¿Qué tiene para broca?", None, productos) == "¿Qué tiene para broca?"
+
+
+def test_groundedness_misma_dosis_con_otra_ortografia():
+    from app.services.rag_service import validar_groundedness_dosis
+    ficha = "Producto: EVITO T | Dosis: 0.3 Lt/Ha | Condiciones: intervalo 15 días"
+    assert validar_groundedness_dosis("Aplique 0.3 L/ha cada 15 días.", ficha)
+    assert validar_groundedness_dosis("Aplique 0,3 litros/ha.", ficha)
+    assert not validar_groundedness_dosis("Aplique 0.5 L/ha.", ficha)       # otra cifra
+    assert not validar_groundedness_dosis("Aplique 0.3 L/mz.", ficha)       # otra área
+    assert not validar_groundedness_dosis("Aplique 0.3 kg/ha.", ficha)      # otra unidad

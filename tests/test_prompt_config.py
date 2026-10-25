@@ -31,6 +31,9 @@ FILAS_VALIDAS = {
     "perfil_msg_pedir_ubicacion": "¿Dónde?",
     "perfil_msg_pedir_terreno": "¿Cómo es el terreno?",
     "perfil_msg_completo": "¿Cuál es su consulta?",
+    "perfil_msg_pedir_faltantes": "Me falta:\n{preguntas}",
+    "perfil_msg_pedir_consulta": "¿Qué problema tiene?",
+    "perfil_msg_pedir_identificacion": "¿Su cédula y WhatsApp?",
     "perfil_extraccion_prompt": "Responde JSON.",
     "perfil_max_preguntas": "4",
     "alcance_prompt": "Responde JSON en_alcance.",
@@ -41,6 +44,12 @@ FILAS_VALIDAS = {
     "producto_selector_prompt": "Responde JSON indice.",
     "producto_linea_template": "Producto AldeaZON recomendado: {producto} ({uso}).{dosis}",
     "msg_producto_tienda": "Producto AldeaZON recomendado: en su tienda le ayudamos.",
+    "inventario_template": "Disponible en: {tiendas}.",
+    "msg_sin_existencias": "Sin existencias.",
+    "msg_inventario_no_disponible": "Existencias no disponibles.",
+    "inventario_max_tiendas": "3",
+    "inventario_alternativas_template": "Con {ingredientes}:\n{productos}",
+    "inventario_max_productos": "3",
 }
 
 

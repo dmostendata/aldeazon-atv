@@ -105,6 +105,35 @@ class CarritoItem(BaseModel):
     )
 
 
+class CultivoContexto(BaseModel):
+    nombre: str = Field(..., min_length=1, max_length=80)
+    area: Optional[float] = Field(None, ge=0, le=100_000)
+    unidad: Optional[str] = Field(None, pattern="^(mz|ha)$")
+
+
+class ContextoInicial(BaseModel):
+    """
+    Perfil ya estructurado (p. ej. un formulario inicial). Se usa en lugar del LLM
+    que extrae el perfil del texto: ese turno no gasta tokens de extracción.
+    `consulta` del request sigue siendo la pregunta o el problema.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    tipo_usuario: Optional[str] = Field(None, pattern="^(socio|cliente|productor|comerciante|tecnico|otro)$")
+    # Solo para identificar al socio: se hashean enseguida, nunca se guardan ni van al LLM.
+    cedula: Optional[str] = Field(None, max_length=20)
+    telefono: Optional[str] = Field(None, max_length=20)
+    cultivos: List[CultivoContexto] = Field(default_factory=list, max_length=10)
+    municipio: Optional[str] = Field(None, max_length=80)
+    comunidad: Optional[str] = Field(None, max_length=80)
+    departamento: Optional[str] = Field(None, max_length=80)
+    etapa_cultivo: Optional[str] = Field(None, max_length=80)
+    topografia: Optional[str] = Field(None, max_length=40)
+    tipo_suelo: Optional[str] = Field(None, max_length=80)
+    altura_msnm: Optional[float] = Field(None, ge=0, le=5000)
+    tipo_negocio: Optional[str] = Field(None, max_length=80)
+
+
 class ChatResponse(BaseModel):
     """
     REST API contract for `POST /api/v1/consultar` consumed by App AldeaZON.
@@ -125,4 +154,10 @@ class ChatResponse(BaseModel):
     )
     perfil: Optional[Dict[str, Any]] = Field(
         None, description="Perfil acumulado del usuario (sin datos personales)"
+    )
+    latencia_pasos: Optional[Dict[str, Any]] = Field(
+        None, description="Latencia por paso (app/services/traza.py): total_ms, pasos [{paso, componente, inicio_ms, ms}], por_componente"
+    )
+    consumo_llm: Optional[Dict[str, Any]] = Field(
+        None, description="Consumo de LLM de este mensaje, todas las llamadas: llamadas, tokens_entrada, tokens_salida, costo_usd"
     )

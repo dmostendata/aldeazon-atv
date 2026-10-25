@@ -54,19 +54,21 @@ default_args = {
 @dag(
     dag_id="atv_perfil_productor",
     default_args=default_args,
-    description="Perfil de socios/clientes y sus fincas para el ATV (stg_cafe -> atv.perfil_*)",
-    # Después de las cargas de Semillero que usa: perfil_finca y asociados a las
-    # 20:00 y cosecha (persona, cliente, comunidad) a las 23:30 de Managua.
+    description="Perfil de socios/clientes y sus fincas (stg_cafe -> atv.perfil_*) e inventario de AldeaZON (stg_insumos -> atv.inventario_producto) para el ATV",
+    # Después de las cargas de Semillero que usa: perfil_finca, asociados e
+    # insumos_inventario a las 20:00 y cosecha (persona, cliente, comunidad) a
+    # las 23:30 de Managua.
     schedule="30 1 * * *",
     start_date=pendulum.datetime(2026, 10, 1, tz="America/Managua"),
     catchup=False,
     max_active_runs=1,
-    tags=["atv", "perfil", "semillero"],
+    tags=["atv", "perfil", "inventario", "semillero"],
 )
 def atv_perfil_productor():
     """
     Reconstruye atv.perfil_productor, atv.perfil_finca y atv.perfil_lote desde la
-    última foto de stg_cafe (Semillero, catálogo 004). Falla sin tocar los perfiles
+    última foto de stg_cafe (Semillero, catálogo 004), y atv.inventario_producto
+    desde stg_insumos (catálogo 005). Falla sin tocar los perfiles
     vigentes si alguna foto tiene más de 2 días o si el perfil se achica a menos
     de la mitad (ver scripts/construir_perfiles.py).
     """
@@ -75,6 +77,13 @@ def atv_perfil_productor():
     def construir_perfiles() -> None:
         ejecutar_en_vps4("construir_perfiles")
 
+    @task()
+    def construir_inventario() -> None:
+        # Independiente del perfil: si falla uno, el otro se reconstruye igual.
+        # Ver scripts/construir_inventario.py (mismos gates de frescura y tamaño).
+        ejecutar_en_vps4("construir_inventario")
+
     construir_perfiles()
+    construir_inventario()
 
 dag_instance = atv_perfil_productor()
